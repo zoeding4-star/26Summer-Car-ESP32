@@ -1,0 +1,2 @@
+source D:/esp-projects/blink-led/build/gdbinit/symbols
+source D:/esp-projects/blink-led/build/gdbinit/connect
