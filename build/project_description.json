@@ -1220,12 +1220,12 @@
             "dir": "D:/esp-projects/blink-led/main",
             "type": "LIBRARY",
             "lib": "__idf_main",
-            "reqs": [ "esp_driver_gpio", "espressif__led_strip", "esp_driver_ledc" ],
+            "reqs": [ "esp_driver_gpio", "espressif__led_strip", "esp_driver_ledc", "esp_timer" ],
             "priv_reqs": [ "espressif__led_strip" ],
             "managed_reqs": [],
             "managed_priv_reqs": [ "espressif__led_strip" ],
             "file": "D:/esp-projects/blink-led/build/esp-idf/main/libmain.a",
-            "sources": [ "D:/esp-projects/blink-led/main/main.c" ],
+            "sources": [ "D:/esp-projects/blink-led/main/main_line_tracking.c", "D:/esp-projects/blink-led/main/main_obstacle_avoid.c" ],
             "include_dirs": [ "." ]
         },
         "mbedtls": {
@@ -2898,7 +2898,7 @@
             "prefix": "idf",
             "dir": "D:/esp-projects/blink-led/main",
             "lib": "__idf_main",
-            "reqs": [ "esp_driver_gpio", "espressif__led_strip", "esp_driver_ledc" ],
+            "reqs": [ "esp_driver_gpio", "espressif__led_strip", "esp_driver_ledc", "esp_timer" ],
             "priv_reqs": [ "espressif__led_strip" ],
             "managed_reqs": [],
             "managed_priv_reqs": [ "espressif__led_strip" ],

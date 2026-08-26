@@ -1,0 +1,7 @@
+CMake Error at run_serial_tool.cmake:67 (message):
+  
+  C:/Espressif/tools/python/v5.4.4/venv/Scripts/python.exe;;C:/esp/v5.4.4/esp-idf/components/esptool_py/esptool/esptool.py;--chip;esp32s3
+  failed.
+
+
+
