@@ -12,9 +12,19 @@
 #编译液晶屏
 # idf_component_register(SRCS "main_led.c"
 #                        INCLUDE_DIRS "."
-#                        REQUIRES esp_driver_gpio led_strip esp_driver_spi esp_driver_ledc esp_timer esp_lcd lvgl)             
+#                        REQUIRES esp_driver_gpio led_strip esp_driver_spi esp_driver_ledc esp_timer esp_lcd lvgl)  
 
 #编译全部功能
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS "main_final.c"
                        INCLUDE_DIRS "."
-                       REQUIRES esp_driver_gpio led_strip esp_driver_ledc esp_timer)                       
+                       REQUIRES esp_driver_gpio led_strip esp_driver_spi esp_driver_ledc esp_timer esp_lcd lvgl)   
+
+#编译测速文件
+# idf_component_register(SRCS "main_speed.c"
+#                        INCLUDE_DIRS "."
+#                        REQUIRES esp_driver_gpio led_strip esp_driver_spi esp_driver_ledc esp_timer esp_lcd lvgl)   
+
+#编译全部功能
+# idf_component_register(SRCS "main.c"
+#                        INCLUDE_DIRS "."
+#                        REQUIRES esp_driver_gpio led_strip esp_driver_ledc esp_timer)                       
