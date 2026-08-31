@@ -78,25 +78,25 @@ static const char* TAG = "MAIN_APP";
 #define PWM_RESOL       8
 #define MAX_SPEED       255
 
-#define BASE_SPEED      80      // 基础速度
-#define STRAFE_SPEED    46      // 横向平移速度
-#define CONTROL_PERIOD  5       // 循迹周期 (ms)
-#define SEARCH_PERIOD   10      // 寻线周期 (ms)
+#define BASE_SPEED      85      // 基础速度
+#define STRAFE_SPEED    47      // 横向平移速度
+#define CONTROL_PERIOD  3       // 循迹周期 (ms)
+#define SEARCH_PERIOD   8      // 寻线周期 (ms)
 
 #define WHEEL_DISTANCE  0.1f
 #define SIN_60          0.8660254f
 #define COS_60          0.5f
 
 #define MICRO_PULSE_MS  2
-#define MACRO_PULSE_MS  3
-#define OMEGA_MICRO     12.0f
-#define OMEGA_MACRO     15.0f
-#define OMEGA_SEARCH    300.0f
+#define MACRO_PULSE_MS  2.5
+#define OMEGA_MICRO     15.0f
+#define OMEGA_MACRO     18.0f
+#define OMEGA_SEARCH    310.0f
 
 // 轮速 Scale 调节参数
-#define STRAFE_SCALE_D   0.90f     
-#define STRAFE_SCALE_A   0.90f     
-#define STRAFE_SCALE_B   1.13f     
+#define STRAFE_SCALE_D   0.87f     
+#define STRAFE_SCALE_A   0.87f     
+#define STRAFE_SCALE_B   1.20f     
 
 #define FWD_SCALE_D      1.00f
 #define FWD_SCALE_A      1.00f
@@ -609,8 +609,8 @@ void mainControlTask(void* pvParameters) {
         float distance = getUltrasonicDistance();
         if (distance > 0.0f && distance <= 5.0f) {
             ESP_LOGW(TAG, "🚨 障碍触发 (%.2f cm)！避障中...", distance);
-            stopMotors();
-            vTaskDelay(pdMS_TO_TICKS(300));
+            // stopMotors();
+            // vTaskDelay(pdMS_TO_TICKS(300));
             break;
         }
         controlLoop(BASE_SPEED);
@@ -618,29 +618,29 @@ void mainControlTask(void* pvParameters) {
 
     // 阶段 2：平移避障
     Velocity vel_strafe_away = { .vx = (float)STRAFE_SPEED, .vy = 0.0f, .omega = 0.0f };
-    executePulse(vel_strafe_away, 1000); 
+    executePulse(vel_strafe_away, 800); 
 
     while (1) {
-        executePulse(vel_strafe_away, 50); 
+        executePulse(vel_strafe_away, 100); 
         float distance = getUltrasonicDistance();
-        if (distance > 20.0f) {
-            executePulse(vel_strafe_away, 20); 
-            stopMotors();
+        if (distance > 5.0f) {
+            executePulse(vel_strafe_away, 11);
+            stopMotors(); 
             vTaskDelay(pdMS_TO_TICKS(400));
             break;
         }
     }
 
-    // 阶段 3：直行 1.8s
+    // 阶段 3：直行 1.5s
     Velocity vel_fwd = { .vx = 0.0f, .vy = (float)BASE_SPEED, .omega = 0.0f };
-    executePulse(vel_fwd, 1800); 
+    executePulse(vel_fwd, 1530); 
     stopMotors();
     vTaskDelay(pdMS_TO_TICKS(200));
 
     // 阶段 4：反向平移找黑线
-    Velocity vel_strafe_back = { .vx = -(float)STRAFE_SPEED, .vy = 0.0f, .omega = 0.0f };
+    Velocity vel_strafe_back = { .vx = -(float)STRAFE_SPEED*0.90, .vy = 0.0f, .omega = 0.0f };
     while (1) {
-        executePulse(vel_strafe_back, 30);
+        executePulse(vel_strafe_back, 25);
         SensorData data;
         readSensors(&data);
         if (getSensorCode(&data) != 0b0000) {
