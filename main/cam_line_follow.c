@@ -1,12 +1,12 @@
 /**
- * 摄像头黑线循迹（直线 / 锐角 / 直角，并区分左转右转）
+ * 摄像头黑线循迹
  *
- * 硬件参考本工程：
- *   - 电机引脚与三轮全向运动学：cam_motion.c / main_final.c
- *   - UVC MJPEG 取流：camera.c（usb_stream，480x320）
+ * 控制对齐 main_line_tracking.c 的红外逻辑：
+ *   - 看到竖线 → 直行，用竖线最低端偏角做小调/大调
+ *   - 左侧或右侧出现大横带 / 折线 → 只记住转弯方向，不转
+ *   - 看不到黑线 → 按记忆方向三轮同速同向原地自转
  *
- * 画面约定：摄像头前视俯拍地面，y=0 在画面上方（远端），画面底部是车头近端。
- * 若实际装反，把 CAM_FLIP_UD / CAM_FLIP_LR 改为 1。
+ * 画面：大 y=车头近端。翻转用 CAM_FLIP_UD / CAM_FLIP_LR。
  */
 
 #include <stdio.h>
@@ -29,13 +29,17 @@
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
 #include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
 
 #include "usb_stream.h"
 #include "tjpgd.h"
 
 static const char *TAG = "CAM_LINE";
 
-/* ==================== 电机引脚（与 cam_motion.c 一致） ==================== */
+/* ==================== 电机 ==================== */
 #define MOTOR_D_PWM     GPIO_NUM_14
 #define MOTOR_D_IN1     GPIO_NUM_13
 #define MOTOR_D_IN2     GPIO_NUM_12
@@ -51,80 +55,51 @@ static const char *TAG = "CAM_LINE";
 #define LEDC_CH_D       LEDC_CHANNEL_0
 #define LEDC_CH_A       LEDC_CHANNEL_1
 #define LEDC_CH_B       LEDC_CHANNEL_2
-#define PWM_FREQ        16000   /* 提高载波，静摩擦下力矩更连续 */
+#define PWM_FREQ        16000
 #define PWM_RESOL       8
 #define MAX_SPEED       255
-#define PWM_CAP         66      /* 轮速硬上限；直行不再默认拉满 */
-
-#define WHEEL_DISTANCE  0.1f
-#define SIN_60          0.8660254f
-#define COS_60          0.5f
-
-#define FWD_SCALE_D     1.00f
-#define FWD_SCALE_A     1.00f
-#define FWD_SCALE_B     1.00f
-#define ROT_SCALE_D     1.00f
-#define ROT_SCALE_A     1.00f
-#define ROT_SCALE_B     1.00f
+#define PWM_CAP         66
 
 /* ==================== 摄像头 ==================== */
 #define CAM_WIDTH           480
 #define CAM_HEIGHT          320
-#define CAM_FPS             15
-#define JPEG_DSCALE         2       /* 1/4 分辨率，优先把控制周期打上去 */
+#define CAM_FPS             30
+#define JPEG_DSCALE         3       /* 1/8，把解码从 ~100ms 打到几十 ms */
 #define JPEG_XFER_SIZE      (88 * 1024)
-#define CAM_FLIP_UD         1       /* 画面上下颠倒时改 1 */
-#define CAM_FLIP_LR         1       /* 画面左右镜像时改 1 */
+#define CAM_FLIP_UD         1
+#define CAM_FLIP_LR         1
 
-/* 逻辑坐标：大 y=车头近端，小 y=画面上方远预瞄。最后几行尽量靠近地平线，才能提前看到弯 */
-#define SCAN_ROWS           10
-static const int SCAN_Y[SCAN_ROWS] = { 292, 250, 210, 170, 135, 100, 72, 48, 28, 12 };
-#define NEAR_IDX            0
-#define MID_IDX             4
-#define FAR_IDX             9
-#define LOOKAHEAD_FROM      6
+#define SCAN_Y_NEAR         320
+#define SCAN_Y_FAR          220
+#define SCAN_ROWS           5
+#define ROI_X0_480          180
+#define ROI_X1_480          300
 
 #define LINE_THRESH_MIN     28
 #define LINE_THRESH_MAX     140
-#define MIN_LINE_W          5
-#define MAX_LINE_W          70
-#define HORIZ_BAR_W         95      /* 超过此宽度视为横向横杠（直角特征） */
+#define MIN_LINE_W          1
+#define MAX_LINE_W          18      /* 1/8 图上竖线很窄；更宽当横带 */
 #define MAX_BLOBS           4
+#define STEM_MAX_JUMP       8
+#define BAR_FRAC            40      /* 一行黑像素占 ROI 百分比，视为横带 */
+#define SIDE_RATIO          2.2f
+#define MIN_SIDE_MASS       6
+#define KINK_PX             3
 
-/* vy 直接就是前轮前进 PWM。66 冲出弯道，远点丢失时更要收油 */
-#define BASE_SPEED          56.0f
-#define CAUTION_SPEED       44.0f   /* 远点看不到时 */
-#define CURVE_SPEED         36.0f
-#define ACUTE_SPEED         26.0f
-#define CORNER_APPROACH     24.0f
-#define KP                  0.14f
-#define KD                  0.06f
-#define KP_ACUTE            0.22f
-#define KD_ACUTE            0.08f
-#define DEADBAND            4.0f
-#define MAX_OMEGA_PD        14.0f
-#define MAX_OMEGA_ACUTE     20.0f
-#define OMEGA_CORNER        22.0f
-#define OMEGA_SEARCH        20.0f
-#define ROT_MAX             22.0f
-#define SIDE_RATIO          2.4f
-#define MIN_SIDE_MASS       24
-#define LOST_STOP_FRAMES    40
-#define CORNER_SPIN_TIMEOUT_MS  1200
-#define CORNER_CONFIRM_FRAMES   4
-#define ERR_FILTER          0.50f
-#define HOLD_TURN_FRAMES        6
-#define DIR_LOCK_MS             350
-#define SLOW_HOLD_FRAMES        16  /* 见过弯后保持低速，避免判回 STRAIGHT 又踩满 */
+/* 对齐红外：直行 + 两档角速度；自转三轮同速 */
+#define BASE_SPEED          40.0f
+#define OMEGA_MICRO         9.0f
+#define OMEGA_MACRO         16.0f
+#define ROT_MAX             18.0f
+#define SPIN_PWM            26.0f
+#define DEAD_PX_480         10
+#define MACRO_PX_480        28
+#define LOST_STOP_FRAMES    180
 
 /* ==================== 类型 ==================== */
 typedef struct {
     float D, A, B;
 } MotorSpeed;
-
-typedef struct {
-    float vx, vy, omega;
-} Velocity;
 
 typedef enum {
     LAST_DIR_LEFT = 0,
@@ -132,22 +107,15 @@ typedef enum {
 } LastDir;
 
 typedef enum {
-    PATH_LOST = 0,
-    PATH_STRAIGHT,
-    PATH_CURVE_LEFT,
-    PATH_CURVE_RIGHT,
-    PATH_ACUTE_LEFT,
-    PATH_ACUTE_RIGHT,
-    PATH_RIGHT_ANGLE_LEFT,
-    PATH_RIGHT_ANGLE_RIGHT,
-    PATH_CROSS
-} PathType;
+    MODE_FOLLOW = 0,
+    MODE_SPIN
+} DriveMode;
 
 typedef enum {
-    MODE_FOLLOW = 0,
-    MODE_CORNER,
-    MODE_SEARCH
-} DriveMode;
+    VIEW_NONE = 0,  /* 看不见黑线 */
+    VIEW_STEM,      /* 有竖线，直行微调 */
+    VIEW_BAR        /* 只有横带，还看见黑，先记方向再往前 */
+} ViewType;
 
 typedef struct {
     int left, right, cx, width, mass;
@@ -156,51 +124,62 @@ typedef struct {
 typedef struct {
     int n;
     Blob b[MAX_BLOBS];
-    int main_cx;
-    int main_w;
-    bool valid;
-    bool wide_bar;
+    int black_n;
+    int span;
+    bool full_bar;
 } RowScan;
 
 typedef struct {
-    PathType type;
+    ViewType type;
     int near_cx;
     int far_cx;
-    int heading;
+    int angle;       /* 最低端偏角：>0 底端偏右 */
     int offset;
     bool near_ok;
-    bool far_ok;
+    bool has_black;
+    bool turn_left;
+    bool turn_right;
     int left_mass;
     int right_mass;
-} PathInfo;
+    int stem_n;
+    int kink;
+    int near_y;
+    int far_y;
+    int corner_x;
+    int corner_y;
+} Sight;
 
 /* ==================== 全局 ==================== */
 static LastDir g_last_dir = LAST_DIR_LEFT;
 static DriveMode g_mode = MODE_FOLLOW;
-static PathType g_corner_dir = PATH_RIGHT_ANGLE_LEFT;
-static int64_t g_corner_t0 = 0;
 static int g_lost_frames = 0;
-static int g_corner_hits = 0;
-static PathType g_hold_turn = PATH_LOST;
-static int g_hold_frames = 0;
-static LastDir g_dir_lock = LAST_DIR_LEFT;
-static int64_t g_dir_lock_until = 0;
-static int g_slow_frames = 0;
-static int g_wrong_corner = 0;
-static float g_last_err = 0.0f;
 static int g_decode_ms = 0;
-static float g_err_filt = 0.0f;
 static MotorSpeed g_last_wheels = {0, 0, 0};
 static float g_last_vy = 0.0f;
 static float g_last_om = 0.0f;
 
 static SemaphoreHandle_t s_frame_mutex;
 static SemaphoreHandle_t s_frame_ready;
+static SemaphoreHandle_t s_dbg_mutex;
 static uint8_t *s_jpeg;
 static volatile uint32_t s_jpeg_len;
 static uint8_t *s_gray;
+static uint8_t *s_bin;
+static uint8_t *s_dbg_gray;
+static uint8_t *s_dbg_bin;
 static int s_img_w = CAM_WIDTH;
 static int s_img_h = CAM_HEIGHT;
+static RowScan g_scan_rows[SCAN_ROWS];
+static int g_scan_y[SCAN_ROWS];
+static int g_poly_x[SCAN_ROWS];
+static int g_poly_y[SCAN_ROWS];
+static int g_poly_n;
+static Sight g_dbg_path;
+static int g_dbg_w;
+static int g_dbg_h;
+static char s_dbg_json[4096];
+static int s_dbg_json_len;
+static volatile bool s_dbg_ready;
 
 /* ==================== 电机 ==================== */
 static void motor_init(void)
@@ -267,31 +246,6 @@ static void stop_motors(void)
     set_all_motors(&z);
 }
 
-static MotorSpeed __attribute__((unused)) inverse_kinematics(const Velocity *vel)
-{
-    MotorSpeed w;
-    float L = WHEEL_DISTANCE;
-    w.D = -SIN_60 * vel->vx + COS_60 * vel->vy + L * vel->omega;
-    w.A =  SIN_60 * vel->vx + COS_60 * vel->vy - L * vel->omega;
-    w.B =  vel->vx + L * vel->omega;
-    return w;
-}
-
-static float lock_omega(float om)
-{
-    if (esp_timer_get_time() >= g_dir_lock_until) {
-        return om;
-    }
-    /* 锁定期内只允许原先那个方向的差速，反向指令直接抹掉 */
-    if (g_dir_lock == LAST_DIR_LEFT && om > 0.0f) {
-        return 0.0f;
-    }
-    if (g_dir_lock == LAST_DIR_RIGHT && om < 0.0f) {
-        return 0.0f;
-    }
-    return om;
-}
-
 static float clampf(float v, float lo, float hi)
 {
     if (v < lo) return lo;
@@ -299,7 +253,7 @@ static float clampf(float v, float lo, float hi)
     return v;
 }
 
-/* vy 即前进 PWM，转向只用差速，禁止再按峰值拉满 */
+/* 直行差速：B 只辅助一点点。自转不用这个。 */
 static void drive(float vy, float omega)
 {
     float fwd = 0.0f;
@@ -311,7 +265,7 @@ static void drive(float vy, float omega)
     MotorSpeed s;
     s.D = clampf(fwd + rot, -(float)PWM_CAP, (float)PWM_CAP);
     s.A = clampf(fwd - rot, -(float)PWM_CAP, (float)PWM_CAP);
-    s.B = clampf(rot * 0.45f, -(float)PWM_CAP, (float)PWM_CAP);
+    s.B = clampf(rot * 0.70f, -(float)PWM_CAP, (float)PWM_CAP);
 
     g_last_vy = vy;
     g_last_om = rot;
@@ -319,7 +273,19 @@ static void drive(float vy, float omega)
     set_all_motors(&s);
 }
 
-/* ==================== 图像访问 ==================== */
+/* 三轮同速原地转：右前 A 反向，D/B 同向 */
+static void spin_in_place(bool left)
+{
+    float s = left ? -SPIN_PWM : SPIN_PWM;
+    s = clampf(s, -(float)PWM_CAP, (float)PWM_CAP);
+    MotorSpeed m = { s, -s, s };
+    g_last_vy = 0.0f;
+    g_last_om = s;
+    g_last_wheels = m;
+    set_all_motors(&m);
+}
+
+/* ==================== 图像 ==================== */
 static void *psram_alloc(size_t n)
 {
     void *p = heap_caps_aligned_alloc(16, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -345,9 +311,7 @@ static inline int map_y(int y, int h)
 
 static uint8_t luma_at(int x, int y)
 {
-    int w = s_img_w;
-    int h = s_img_h;
-    return s_gray[map_y(y, h) * w + map_x(x, w)];
+    return s_gray[map_y(y, s_img_h) * s_img_w + map_x(x, s_img_w)];
 }
 
 typedef struct {
@@ -383,10 +347,6 @@ static int tjd_out(JDEC *jd, void *bitmap, JRECT *rect)
         memcpy(io->gray + (size_t)y * io->stride + rect->left, src, (size_t)bw);
         src += bw;
     }
-    /* 让出 CPU，避免 IDLE0 看门狗，同时提高后续控制节奏 */
-    if ((rect->top & 0x0F) == 0) {
-        vTaskDelay(0);
-    }
     return 1;
 }
 
@@ -413,7 +373,7 @@ static bool decode_mjpeg(const uint8_t *jpg, int len)
 
     int out_w = jd.width >> JPEG_DSCALE;
     int out_h = jd.height >> JPEG_DSCALE;
-    if (out_w < 20 || out_h < 20) {
+    if (out_w < 16 || out_h < 16) {
         return false;
     }
     s_img_w = out_w;
@@ -431,618 +391,682 @@ static bool decode_mjpeg(const uint8_t *jpg, int len)
 static int scaled_px(int px480)
 {
     int v = px480 * s_img_w / CAM_WIDTH;
-    return (v < 2) ? 2 : v;
+    return (v < 1) ? 1 : v;
 }
 
-static int horiz_bar_w(void)
+static int roi_x0(void)
 {
-    int w = s_img_w / 3;
-    return (w < 28) ? 28 : w;
+    int x = scaled_px(ROI_X0_480);
+    return (x < 0) ? 0 : x;
+}
+
+static int roi_x1(void)
+{
+    int x = scaled_px(ROI_X1_480);
+    if (x >= s_img_w) {
+        x = s_img_w - 1;
+    }
+    return x;
 }
 
 static int max_line_w(void)
 {
-    int w = scaled_px(MAX_LINE_W);
-    return (w < 16) ? 16 : w;
-}
-static int adaptive_thresh(void)
-{
-    int w = s_img_w;
-    uint32_t sum = 0;
-    int n = 0;
-    int min_l = 255;
-    for (int i = 0; i < SCAN_ROWS; i++) {
-        int y = SCAN_Y[i] * s_img_h / CAM_HEIGHT;
-        for (int x = 8; x < w - 8; x += 8) {
-            int v = luma_at(x, y);
-            sum += (uint32_t)v;
-            n++;
-            if (v < min_l) {
-                min_l = v;
-            }
-        }
+    int w = scaled_px(MAX_LINE_W * CAM_WIDTH / 120);
+    if (w < 4) {
+        w = 4;
     }
-    if (n == 0) {
-        return 90;
-    }
-    int mean = (int)(sum / (uint32_t)n);
-    int span = mean - min_l;
-    int th;
-    if (span < 18) {
-        /* 对比度差：只吃明显比均值暗的点，避免把深色地板当线 */
-        th = mean - 12;
-    } else {
-        /* 贴着最暗的线，不要把偏暗的地面整片算进去 */
-        th = min_l + span * 2 / 5;
-    }
-    if (th < LINE_THRESH_MIN) th = LINE_THRESH_MIN;
-    if (th > LINE_THRESH_MAX) th = LINE_THRESH_MAX;
-    return th;
-}
-
-static void scan_row(int y, int thresh, int min_w, RowScan *out)
-{
-    memset(out, 0, sizeof(*out));
-    int w = s_img_w;
-    int x0 = 4;
-    int x1 = w - 5;
-    int span = x1 - x0 + 1;
-    int black_n = 0;
-    for (int x = x0; x <= x1; x++) {
-        if (luma_at(x, y) < thresh) {
-            black_n++;
-        }
-    }
-    /* 整行大面积偏暗 = 地板/阴影，不是线 */
-    if (span > 0 && black_n * 100 > span * 48) {
-        return;
-    }
-
-    int run_l = -1;
-    for (int x = x0; x <= x1 + 1; x++) {
-        bool black = (x <= x1) && (luma_at(x, y) < thresh);
-        if (black && run_l < 0) {
-            run_l = x;
-        } else if (!black && run_l >= 0) {
-            int run_r = x - 1;
-            int width = run_r - run_l + 1;
-            if (width >= min_w && out->n < MAX_BLOBS) {
-                int mass = 0, sx = 0;
-                for (int k = run_l; k <= run_r; k++) {
-                    if (luma_at(k, y) < thresh) {
-                        mass++;
-                        sx += k;
-                    }
-                }
-                if (mass >= min_w) {
-                    Blob *b = &out->b[out->n++];
-                    b->left = run_l;
-                    b->right = run_r;
-                    b->width = width;
-                    b->mass = mass;
-                    b->cx = sx / mass;
-                    if (width >= horiz_bar_w()) {
-                        out->wide_bar = true;
-                    }
-                }
-            }
-            run_l = -1;
-        }
-    }
-
-    if (out->n > 0) {
-        out->valid = true;
-        /* 先选最接近画面中心的 blob 作为主线，后续会按路径跟踪修正 */
-        int cx0 = w / 2;
-        int best = 0;
-        int best_d = 9999;
-        for (int i = 0; i < out->n; i++) {
-            int d = abs(out->b[i].cx - cx0);
-            if (d < best_d && out->b[i].width <= max_line_w() * 2) {
-                best_d = d;
-                best = i;
-            }
-        }
-        /* 若存在超宽横杠，优先记宽度，主 cx 仍用最接近中心且不太宽的段 */
-        out->main_cx = out->b[best].cx;
-        out->main_w = out->b[best].width;
-    }
-}
-
-static int pick_main_cx(const RowScan *row, int pred_cx)
-{
-    if (!row->valid) {
-        return -1;
-    }
-    int best = 0;
-    int best_d = 9999;
-    for (int i = 0; i < row->n; i++) {
-        int d = abs(row->b[i].cx - pred_cx);
-        /* 直角横杠上不要把整条杠的中点当成主线 */
-        if (row->b[i].width > horiz_bar_w()) {
-            continue;
-        }
-        if (d < best_d) {
-            best_d = d;
-            best = i;
-        }
-    }
-    if (best_d == 9999) {
-        return row->b[0].cx;
-    }
-    return row->b[best].cx;
-}
-
-static int side_mass(int y, int thresh, bool left)
-{
-    int w = s_img_w;
-    int x_a, x_b;
-    if (left) {
-        x_a = 6;
-        x_b = w / 3;
-    } else {
-        x_a = w * 2 / 3;
-        x_b = w - 7;
-    }
-    /* 只统计成段的黑线，不把深色地面散点算成分叉 */
-    int m = 0;
-    int run = 0;
-    int min_w = scaled_px(MIN_LINE_W);
-    int max_w = max_line_w() * 2;
-    for (int x = x_a; x <= x_b + 1; x++) {
-        bool black = (x <= x_b) && (luma_at(x, y) < thresh);
-        if (black) {
-            run++;
-        } else if (run > 0) {
-            if (run >= min_w && run <= max_w) {
-                m += run;
-            }
-            run = 0;
-        }
-    }
-    return m;
-}
-
-static const char *path_name(PathType t)
-{
-    switch (t) {
-    case PATH_STRAIGHT: return "STRAIGHT";
-    case PATH_CURVE_LEFT: return "CURVE_L";
-    case PATH_CURVE_RIGHT: return "CURVE_R";
-    case PATH_ACUTE_LEFT: return "ACUTE_L";
-    case PATH_ACUTE_RIGHT: return "ACUTE_R";
-    case PATH_RIGHT_ANGLE_LEFT: return "90_L";
-    case PATH_RIGHT_ANGLE_RIGHT: return "90_R";
-    case PATH_CROSS: return "CROSS";
-    default: return "LOST";
-    }
-}
-
-/**
- * 分类要点：
- * - 直线：近远端都有线，质心差小
- * - 缓弯：连续斜线，heading 中等
- * - 锐角：连续斜线，heading 很大（远端线已明显甩到一侧）
- * - 直角：近端仍有竖线，远端中轴丢线，中部出现横杠或单侧分叉
- * 左右：看 heading 符号，或左右翼黑色像素量
- */
-static PathInfo classify_path(void)
-{
-    PathInfo info = {0};
-    int thresh = adaptive_thresh();
-    int h = s_img_h;
-    int w = s_img_w;
-    int cx_img = w / 2;
-
-    RowScan rows[SCAN_ROWS];
-    for (int i = 0; i < SCAN_ROWS; i++) {
-        int y = SCAN_Y[i] * h / CAM_HEIGHT;
-        int min_w = scaled_px((i < 3) ? MIN_LINE_W + 2 : MIN_LINE_W);
-        scan_row(y, thresh, min_w, &rows[i]);
-    }
-
-    /* 从近到远跟踪主路径 */
-    int pred = cx_img;
-    int tracked[SCAN_ROWS];
-    for (int i = 0; i < SCAN_ROWS; i++) {
-        tracked[i] = pick_main_cx(&rows[i], pred);
-        if (tracked[i] >= 0) {
-            pred = tracked[i];
-        }
-    }
-
-    /* 远端横杠不算竖线预瞄；同一行里若还有窄 blob，仍可当主线 */
-    int far_center_ok = 0;
-    int far_line_n = 0;
-    int far_cx_best = -1;
-    for (int i = FAR_IDX; i >= LOOKAHEAD_FROM; i--) {
-        if (tracked[i] < 0) {
-            continue;
-        }
-        int tw = max_line_w() + 1;
-        for (int k = 0; k < rows[i].n; k++) {
-            if (rows[i].b[k].cx == tracked[i]) {
-                tw = rows[i].b[k].width;
-                break;
-            }
-        }
-        if (tw > max_line_w()) {
-            continue;
-        }
-        int margin = s_img_w / 8;
-        if (tracked[i] < margin || tracked[i] > s_img_w - 1 - margin) {
-            continue;
-        }
-        far_line_n++;
-        if (far_cx_best < 0) {
-            far_cx_best = tracked[i];
-        }
-        if (abs(tracked[i] - cx_img) < w / 5) {
-            far_center_ok++;
-        }
-    }
-    bool far_stem = far_line_n >= 1;
-
-    info.near_cx = tracked[NEAR_IDX];
-    info.near_ok = info.near_cx >= 0;
-    info.far_cx = far_cx_best;
-    info.far_ok = far_stem && far_cx_best >= 0;
-    info.offset = info.near_ok ? (info.near_cx - cx_img) : 0;
-    info.heading = (info.near_ok && info.far_ok) ? (info.far_cx - info.near_cx) : 0;
-
-    int mid_y = SCAN_Y[MID_IDX] * h / CAM_HEIGHT;
-    int near_y = SCAN_Y[NEAR_IDX] * h / CAM_HEIGHT;
-    int far_y = SCAN_Y[FAR_IDX] * h / CAM_HEIGHT;
-    int far2_y = SCAN_Y[FAR_IDX - 1] * h / CAM_HEIGHT;
-    info.left_mass = side_mass(mid_y, thresh, true) + side_mass(near_y, thresh, true)
-                   + side_mass(far_y, thresh, true) + side_mass(far2_y, thresh, true);
-    info.right_mass = side_mass(mid_y, thresh, false) + side_mass(near_y, thresh, false)
-                    + side_mass(far_y, thresh, false) + side_mass(far2_y, thresh, false);
-
-    int valid_n = 0;
-    int wide_n = 0;
-    for (int i = 0; i < SCAN_ROWS; i++) {
-        if (rows[i].valid) {
-            valid_n++;
-        }
-        if (rows[i].wide_bar) {
-            wide_n++;
-        }
-    }
-
-    bool far_lost = !far_stem;
-    int min_side = scaled_px(MIN_SIDE_MASS);
-    bool both_branch = info.left_mass > min_side && info.right_mass > min_side &&
-                       info.left_mass * 2 > info.right_mass && info.right_mass * 2 > info.left_mass;
-
-    if (valid_n == 0 && !info.near_ok) {
-        info.type = PATH_LOST;
-        return info;
-    }
-
-    /* 十字：远端中轴仍有线，且两侧都有分叉 → 直行穿过 */
-    if (both_branch && far_center_ok >= 1 && info.near_ok && abs(info.heading) < (w / 8)) {
-        info.type = PATH_CROSS;
-        return info;
-    }
-
-    /*
-     * 直角：近端明显偏到一侧 + 看到横杠 + 远端丢线。
-     * 方向跟近端质心，不要用左右翼黑像素——新赛道地板偏暗时右侧会一直虚高，
-     * 日志里 CURVE_L 紧接着被判成 90_R 然后反方向转。
-     */
-    bool near_centered = info.near_ok && abs(info.offset) < (w / 6);
-    if (info.near_ok && !near_centered && wide_n > 0 && far_lost) {
-        if (info.offset < 0) {
-            info.type = PATH_RIGHT_ANGLE_LEFT;
-        } else {
-            info.type = PATH_RIGHT_ANGLE_RIGHT;
-        }
-        return info;
-    }
-
-    int acute_px = s_img_w / 3;
-    int curve_px = s_img_w / 10;
-
-    if (info.near_ok && info.far_ok) {
-        int ah = abs(info.heading);
-        if (ah >= acute_px) {
-            info.type = (info.heading < 0) ? PATH_ACUTE_LEFT : PATH_ACUTE_RIGHT;
-        } else if (ah >= curve_px) {
-            info.type = (info.heading < 0) ? PATH_CURVE_LEFT : PATH_CURVE_RIGHT;
-        } else {
-            info.type = PATH_STRAIGHT;
-        }
-        return info;
-    }
-
-    /* 只有近端：按偏移判断，不要把丢远点误判成锐角/直角 */
-    if (info.near_ok) {
-        int off = abs(info.offset);
-        if (off > (w / 8)) {
-            info.type = (info.offset < 0) ? PATH_CURVE_LEFT : PATH_CURVE_RIGHT;
-        } else {
-            info.type = PATH_STRAIGHT;
-        }
-        return info;
-    }
-
-    info.type = PATH_LOST;
-    return info;
-}
-
-static float pd_omega(int error_px, float kp, float kd, float max_w)
-{
-    float err = (float)error_px;
-    g_err_filt = ERR_FILTER * g_err_filt + (1.0f - ERR_FILTER) * err;
-    err = g_err_filt;
-    if (fabsf(err) < DEADBAND) {
-        err = 0.0f;
-    }
-    float d = err - g_last_err;
-    g_last_err = err;
-    float w = kp * err + kd * d;
-    if (w > max_w) w = max_w;
-    if (w < -max_w) w = -max_w;
     return w;
 }
 
-static void remember_dir(const PathInfo *p)
+/* 只二值化扫描行，不整幅膨胀 */
+static void scan_row(int y, RowScan *out)
 {
-    switch (p->type) {
-    case PATH_CURVE_LEFT:
-    case PATH_ACUTE_LEFT:
-    case PATH_RIGHT_ANGLE_LEFT:
-        g_last_dir = LAST_DIR_LEFT;
-        break;
-    case PATH_CURVE_RIGHT:
-    case PATH_ACUTE_RIGHT:
-    case PATH_RIGHT_ANGLE_RIGHT:
-        g_last_dir = LAST_DIR_RIGHT;
-        break;
-    default:
-        if (p->near_ok) {
-            g_last_dir = (p->near_cx < s_img_w / 2) ? LAST_DIR_LEFT : LAST_DIR_RIGHT;
+    memset(out, 0, sizeof(*out));
+    int x0 = roi_x0();
+    int x1 = roi_x1();
+    int span = x1 - x0 + 1;
+    if (span < 4) {
+        return;
+    }
+    out->span = span;
+
+    int sum = 0;
+    for (int x = x0; x <= x1; x++) {
+        sum += luma_at(x, y);
+    }
+    int mean = sum / span;
+    int th = mean - 18;
+    if (th < LINE_THRESH_MIN) {
+        th = LINE_THRESH_MIN;
+    }
+    if (th > LINE_THRESH_MAX) {
+        th = LINE_THRESH_MAX;
+    }
+
+    int run0 = -1;
+    int black_n = 0;
+    for (int x = x0; x <= x1 + 1; x++) {
+        bool on = false;
+        if (x <= x1) {
+            on = luma_at(x, y) < th;
+            s_bin[y * s_img_w + x] = on ? 1 : 0;
+            if (on) {
+                black_n++;
+            }
         }
-        break;
+        if (on) {
+            if (run0 < 0) {
+                run0 = x;
+            }
+        } else if (run0 >= 0) {
+            int w = x - run0;
+            if (w >= MIN_LINE_W && out->n < MAX_BLOBS) {
+                Blob *b = &out->b[out->n++];
+                b->left = run0;
+                b->right = x - 1;
+                b->width = w;
+                b->cx = (run0 + x - 1) / 2;
+                b->mass = w;
+            }
+            run0 = -1;
+        }
+    }
+    out->black_n = black_n;
+    out->full_bar = (black_n * 100 >= span * BAR_FRAC);
+}
+
+static int pick_stem_cx(const RowScan *row, int pred, int max_jump)
+{
+    int best = -1;
+    int best_d = 10000;
+    int cap = max_line_w();
+    for (int i = 0; i < row->n; i++) {
+        if (row->b[i].width > cap && !row->full_bar) {
+            continue;
+        }
+        if (row->full_bar) {
+            continue;
+        }
+        int d = abs(row->b[i].cx - pred);
+        if (d < best_d && d <= max_jump) {
+            best_d = d;
+            best = row->b[i].cx;
+        }
+    }
+    return best;
+}
+
+static void probe_sides(int cx, int y, int *left, int *right)
+{
+    int x0 = roi_x0();
+    int x1 = roi_x1();
+    int L = 0, R = 0;
+    for (int x = x0; x <= x1; x++) {
+        if (!s_bin[y * s_img_w + x]) {
+            continue;
+        }
+        if (x < cx - 1) {
+            L++;
+        } else if (x > cx + 1) {
+            R++;
+        }
+    }
+    *left = L;
+    *right = R;
+}
+
+static const char *view_name(ViewType t)
+{
+    switch (t) {
+    case VIEW_STEM: return "STEM";
+    case VIEW_BAR:  return "BAR";
+    default:        return "NONE";
     }
 }
 
-static float fused_error(const PathInfo *p)
+static Sight look(void)
 {
-    if (p->near_ok && p->far_ok) {
-        return 0.40f * (float)p->offset + 0.60f * (float)p->heading;
+    Sight s;
+    memset(&s, 0, sizeof(s));
+    s.near_cx = -1;
+    s.far_cx = -1;
+    s.near_y = -1;
+    s.far_y = -1;
+    s.corner_x = -1;
+    s.corner_y = -1;
+    g_poly_n = 0;
+
+    int h = s_img_h;
+    int y_near = SCAN_Y_NEAR * h / CAM_HEIGHT;
+    int y_far = SCAN_Y_FAR * h / CAM_HEIGHT;
+    if (y_near >= h) {
+        y_near = h - 1;
     }
-    if (p->near_ok) {
-        return (float)p->offset;
+    if (y_far < 0) {
+        y_far = 0;
     }
-    return (g_last_dir == LAST_DIR_LEFT) ? -MAX_OMEGA_PD : MAX_OMEGA_PD;
-}
-
-static bool is_left_turn(PathType t)
-{
-    return t == PATH_ACUTE_LEFT || t == PATH_RIGHT_ANGLE_LEFT || t == PATH_CURVE_LEFT;
-}
-
-static bool is_right_turn(PathType t)
-{
-    return t == PATH_ACUTE_RIGHT || t == PATH_RIGHT_ANGLE_RIGHT || t == PATH_CURVE_RIGHT;
-}
-
-static bool is_sharp_turn(PathType t)
-{
-    return t == PATH_ACUTE_LEFT || t == PATH_ACUTE_RIGHT ||
-           t == PATH_RIGHT_ANGLE_LEFT || t == PATH_RIGHT_ANGLE_RIGHT;
-}
-
-static float follow_speed(const PathInfo *p, float want)
-{
-    float v = want;
-    if (!p->far_ok && v > CAUTION_SPEED) {
-        v = CAUTION_SPEED;
+    if (y_far >= y_near) {
+        y_far = y_near - (SCAN_ROWS - 1);
+        if (y_far < 0) {
+            y_far = 0;
+        }
     }
-    if (g_slow_frames > 0 && v > CURVE_SPEED) {
-        v = CURVE_SPEED;
-        g_slow_frames--;
+
+    int x0 = roi_x0();
+    int x1 = roi_x1();
+    for (int y = y_far; y <= y_near; y++) {
+        memset(s_bin + y * s_img_w + x0, 0, (size_t)(x1 - x0 + 1));
     }
-    return v;
+
+    for (int i = 0; i < SCAN_ROWS; i++) {
+        int y = y_near - (y_near - y_far) * i / (SCAN_ROWS - 1);
+        g_scan_y[i] = y;
+        scan_row(y, &g_scan_rows[i]);
+        if (g_scan_rows[i].black_n > 0) {
+            s.has_black = true;
+        }
+    }
+
+    int center = s_img_w / 2;
+    int pred = center;
+    int jump = scaled_px(STEM_MAX_JUMP * CAM_WIDTH / 120);
+    if (jump < 4) {
+        jump = 4;
+    }
+    int miss = 0;
+    for (int i = 0; i < SCAN_ROWS; i++) {
+        int cx = pick_stem_cx(&g_scan_rows[i], pred, jump);
+        if (cx < 0) {
+            miss++;
+            if (miss >= 2) {
+                break;
+            }
+            continue;
+        }
+        miss = 0;
+        g_poly_x[g_poly_n] = cx;
+        g_poly_y[g_poly_n] = g_scan_y[i];
+        g_poly_n++;
+        pred = cx;
+    }
+    s.stem_n = g_poly_n;
+
+    if (g_poly_n >= 1) {
+        s.near_ok = true;
+        s.near_cx = g_poly_x[0];
+        s.near_y = g_poly_y[0];
+        s.far_cx = g_poly_x[g_poly_n - 1];
+        s.far_y = g_poly_y[g_poly_n - 1];
+        s.offset = s.near_cx - center;
+        if (g_poly_n >= 2) {
+            s.angle = g_poly_x[0] - g_poly_x[1];
+        } else {
+            s.angle = s.offset;
+        }
+        s.type = VIEW_STEM;
+    }
+
+    int stem_cx = (g_poly_n >= 1) ? g_poly_x[0] : center;
+    int Lall = 0, Rall = 0;
+    for (int i = 0; i < SCAN_ROWS; i++) {
+        int L = 0, R = 0;
+        probe_sides(stem_cx, g_scan_y[i], &L, &R);
+        Lall += L;
+        Rall += R;
+        if (g_scan_rows[i].full_bar) {
+            if (L > R * 1.2f) {
+                s.turn_left = true;
+            } else if (R > L * 1.2f) {
+                s.turn_right = true;
+            }
+        }
+        for (int k = 0; k < g_scan_rows[i].n; k++) {
+            if (g_scan_rows[i].b[k].width >= max_line_w()) {
+                if (g_scan_rows[i].b[k].cx < stem_cx) {
+                    s.turn_left = true;
+                } else if (g_scan_rows[i].b[k].cx > stem_cx) {
+                    s.turn_right = true;
+                }
+            }
+        }
+    }
+    s.left_mass = Lall;
+    s.right_mass = Rall;
+    if (Lall > (int)(Rall * SIDE_RATIO) && Lall >= MIN_SIDE_MASS) {
+        s.turn_left = true;
+    }
+    if (Rall > (int)(Lall * SIDE_RATIO) && Rall >= MIN_SIDE_MASS) {
+        s.turn_right = true;
+    }
+
+    /* 折线：最低端往上方向突变 */
+    int kink = scaled_px(KINK_PX * CAM_WIDTH / 60);
+    if (kink < 2) {
+        kink = 2;
+    }
+    if (g_poly_n >= 3) {
+        for (int i = 1; i < g_poly_n - 1; i++) {
+            int a = g_poly_x[i] - g_poly_x[i - 1];
+            int b = g_poly_x[i + 1] - g_poly_x[i];
+            if (abs(a - b) >= kink && (a * b < 0 || abs(b) >= kink)) {
+                s.kink = abs(a - b);
+                s.corner_x = g_poly_x[i];
+                s.corner_y = g_poly_y[i];
+                if (b < 0 || (b == 0 && a > 0)) {
+                    s.turn_left = true;
+                } else {
+                    s.turn_right = true;
+                }
+            }
+        }
+    }
+
+    if (s.turn_left && s.turn_right) {
+        /* 十字：两边都有，不记转弯 */
+        s.turn_left = false;
+        s.turn_right = false;
+    }
+
+    if (!s.near_ok && s.has_black) {
+        s.type = VIEW_BAR;
+        if (!s.turn_left && !s.turn_right) {
+            if (Lall >= Rall) {
+                s.turn_left = true;
+            } else {
+                s.turn_right = true;
+            }
+        }
+    }
+    if (!s.has_black) {
+        s.type = VIEW_NONE;
+    }
+    return s;
 }
 
-static void apply_follow(const PathInfo *p)
+static const char *debug_hint(const Sight *p)
 {
-    remember_dir(p);
-
     switch (p->type) {
-    case PATH_STRAIGHT:
-    case PATH_CROSS: {
-        float om = lock_omega(pd_omega((int)fused_error(p), KP, KD, MAX_OMEGA_PD));
-        drive(follow_speed(p, BASE_SPEED), om);
-        break;
-    }
-    case PATH_CURVE_LEFT:
-    case PATH_CURVE_RIGHT: {
-        float om = lock_omega(pd_omega((int)fused_error(p), KP + 0.08f, KD, MAX_OMEGA_PD + 4.0f));
-        drive(follow_speed(p, CURVE_SPEED), om);
-        break;
-    }
-    case PATH_ACUTE_LEFT:
-    case PATH_ACUTE_RIGHT: {
-        float om = lock_omega(pd_omega((int)fused_error(p), KP_ACUTE, KD_ACUTE, MAX_OMEGA_ACUTE));
-        drive(follow_speed(p, ACUTE_SPEED), om);
-        break;
-    }
+    case VIEW_STEM:
+        if (p->turn_left) {
+            return "有竖线，左侧有横带或折线：记下左转，现在仍直行微调。";
+        }
+        if (p->turn_right) {
+            return "有竖线，右侧有横带或折线：记下右转，现在仍直行微调。";
+        }
+        return "有竖线：按最低端偏角小调或大调，不转圈。";
+    case VIEW_BAR:
+        return "窗口里是横带、还看不见竖线：记下方向，继续往前，等丢线再自转。";
     default:
-        break;
+        return "看不见黑线：按记忆方向三轮同速同向原地转。";
     }
 }
 
-static bool corner_reacquired(const PathInfo *p)
+static void debug_copy_images(void)
 {
-    /* 旋转结束后：远端重新出现在中轴附近 */
-    if (!p->far_ok) {
-        return false;
+    int w = s_img_w;
+    int h = s_img_h;
+    int x0 = roi_x0();
+    int x1 = roi_x1();
+    int y0 = g_scan_y[SCAN_ROWS - 1];
+    int y1 = g_scan_y[0];
+    if (y0 > y1) {
+        int t = y0;
+        y0 = y1;
+        y1 = t;
     }
-    int c = s_img_w / 2;
-    return abs(p->far_cx - c) < (s_img_w / 6) && abs(p->heading) < (s_img_w / 3);
-}
-
-static void apply_corner(const PathInfo *p)
-{
-    int64_t now = esp_timer_get_time();
-    if (now - g_corner_t0 > (int64_t)CORNER_SPIN_TIMEOUT_MS * 1000) {
-        ESP_LOGW(TAG, "直角旋转超时，改回寻线");
-        g_mode = MODE_SEARCH;
-        return;
-    }
-
-    if (corner_reacquired(p) && (now - g_corner_t0) > 180000) {
-        g_mode = MODE_FOLLOW;
-        g_wrong_corner = 0;
-        g_last_err = 0.0f;
-        apply_follow(p);
-        return;
-    }
-
-    /* 预瞄方向和正在转的直角相反：说明 90 判反了，立刻改跟线 */
-    if (p->far_ok && abs(p->heading) > (s_img_w / 5)) {
-        bool head_left = p->heading < 0;
-        bool corner_left = (g_corner_dir == PATH_RIGHT_ANGLE_LEFT);
-        if (head_left != corner_left) {
-            g_wrong_corner++;
-            if (g_wrong_corner >= 2) {
-                ESP_LOGW(TAG, "直角方向与预瞄相反，改跟线");
-                g_mode = MODE_FOLLOW;
-                g_wrong_corner = 0;
-                g_dir_lock_until = 0;
-                PathInfo tmp = *p;
-                tmp.type = head_left ? PATH_ACUTE_LEFT : PATH_ACUTE_RIGHT;
-                apply_follow(&tmp);
-                return;
+    for (int y = 0; y < h; y++) {
+        uint8_t *dg = s_dbg_gray + y * w;
+        const uint8_t *sg = s_gray + map_y(y, h) * w;
+        if (CAM_FLIP_LR) {
+            for (int x = 0; x < w; x++) {
+                dg[x] = sg[w - 1 - x];
             }
         } else {
-            g_wrong_corner = 0;
+            memcpy(dg, sg, (size_t)w);
         }
-    }
-
-    /* 先慢速贴近拐点，再原地旋转。omega<0 左转，>0 右转（与 cam_motion PD 同号） */
-    bool left = (g_corner_dir == PATH_RIGHT_ANGLE_LEFT);
-    float om = left ? -OMEGA_CORNER : OMEGA_CORNER;
-
-    if ((now - g_corner_t0) < 220000 && p->near_ok) {
-        drive(CORNER_APPROACH, om * 0.35f);
-    } else {
-        drive(0.0f, om);
+        uint8_t *db = s_dbg_bin + y * w;
+        memset(db, 40, (size_t)w);
+        if (s_bin && y >= y0 && y <= y1) {
+            for (int x = x0; x <= x1; x++) {
+                db[x] = s_bin[y * w + x] ? 0 : 255;
+            }
+        }
     }
 }
 
-static void apply_search(void)
+static void debug_update(const Sight *p)
 {
-    float om = (g_last_dir == LAST_DIR_LEFT) ? -OMEGA_SEARCH : OMEGA_SEARCH;
-    drive(0.0f, om);
+    static int dbg_n;
+    if ((++dbg_n & 7) != 0) {
+        return;
+    }
+    if (!s_dbg_mutex || !s_dbg_gray || !s_dbg_bin) {
+        return;
+    }
+    if (xSemaphoreTake(s_dbg_mutex, 0) != pdTRUE) {
+        return;
+    }
+    g_dbg_path = *p;
+    g_dbg_w = s_img_w;
+    g_dbg_h = s_img_h;
+    debug_copy_images();
+
+    int n = snprintf(s_dbg_json, sizeof(s_dbg_json),
+                     "{\"type\":\"%s\",\"md\":%d,\"near\":%d,\"far\":%d,\"heading\":%d,"
+                     "\"offset\":%d,\"L\":%d,\"R\":%d,\"vy\":%.0f,\"om\":%.0f,\"ms\":%d,"
+                     "\"roi0\":%d,\"roi1\":%d,\"ny\":%d,\"fy\":%d,\"kx\":%d,\"ky\":%d,"
+                     "\"stem\":%d,\"kink\":%d,\"rows\":%d,\"ldir\":\"%s\",\"hint\":\"%s\",\"scan_y\":[",
+                     view_name(p->type), (int)g_mode, p->near_cx, p->far_cx, p->angle,
+                     p->offset, p->left_mass, p->right_mass, g_last_vy, g_last_om, g_decode_ms,
+                     roi_x0(), roi_x1(), p->near_y, p->far_y, p->corner_x, p->corner_y,
+                     p->stem_n, p->kink, SCAN_ROWS,
+                     (g_last_dir == LAST_DIR_LEFT) ? "L" : "R",
+                     debug_hint(p));
+    for (int i = 0; i < SCAN_ROWS && n > 0 && n < (int)sizeof(s_dbg_json) - 120; i++) {
+        n += snprintf(s_dbg_json + n, sizeof(s_dbg_json) - (size_t)n, "%s%d",
+                      (i ? "," : ""), g_scan_y[i]);
+    }
+    if (n > 0 && n < (int)sizeof(s_dbg_json) - 20) {
+        n += snprintf(s_dbg_json + n, sizeof(s_dbg_json) - (size_t)n, "],\"blobs\":[");
+    }
+    int first = 1;
+    for (int i = 0; i < SCAN_ROWS && n > 0 && n < (int)sizeof(s_dbg_json) - 80; i++) {
+        for (int k = 0; k < g_scan_rows[i].n && n < (int)sizeof(s_dbg_json) - 80; k++) {
+            n += snprintf(s_dbg_json + n, sizeof(s_dbg_json) - (size_t)n,
+                          "%s{\"x\":%d,\"y\":%d,\"w\":%d}",
+                          first ? "" : ",",
+                          g_scan_rows[i].b[k].cx, g_scan_y[i], g_scan_rows[i].b[k].width);
+            first = 0;
+        }
+    }
+    if (n > 0 && n < (int)sizeof(s_dbg_json) - 20) {
+        n += snprintf(s_dbg_json + n, sizeof(s_dbg_json) - (size_t)n, "],\"poly\":[");
+    }
+    first = 1;
+    for (int i = 0; i < g_poly_n && n > 0 && n < (int)sizeof(s_dbg_json) - 40; i++) {
+        n += snprintf(s_dbg_json + n, sizeof(s_dbg_json) - (size_t)n,
+                      "%s{\"x\":%d,\"y\":%d}",
+                      first ? "" : ",", g_poly_x[i], g_poly_y[i]);
+        first = 0;
+    }
+    if (n > 0 && n < (int)sizeof(s_dbg_json) - 3) {
+        n += snprintf(s_dbg_json + n, sizeof(s_dbg_json) - (size_t)n, "]}");
+    }
+    if (n < 0) {
+        n = 0;
+    }
+    if (n >= (int)sizeof(s_dbg_json)) {
+        n = (int)sizeof(s_dbg_json) - 1;
+        s_dbg_json[n] = '\0';
+    }
+    s_dbg_json_len = n;
+    s_dbg_ready = true;
+    xSemaphoreGive(s_dbg_mutex);
+}
+
+static const char DBG_HTML[] =
+    "<!DOCTYPE html><html><head><meta charset=utf-8><title>循迹画面</title>"
+    "<style>body{font-family:sans-serif;background:#111;color:#ddd;margin:16px;max-width:1100px}"
+    ".row{display:flex;flex-wrap:wrap;gap:16px}"
+    "figure{margin:0}"
+    "canvas{background:#000;image-rendering:pixelated;width:min(46vw,480px);border:1px solid #444}"
+    "figcaption{color:#aaa;margin:6px 0 0}"
+    "pre{background:#1a1a1a;padding:10px;line-height:1.45;white-space:pre-wrap}"
+    "ol{line-height:1.55;color:#ccc} li{margin:6px 0}</style></head><body>"
+    "<h2>原画面 vs 用于判断的二值图</h2>"
+    "<div class=row>"
+    "<figure><canvas id=a width=60 height=40></canvas>"
+    "<figcaption>左：原图（已翻转）。青框=检测窗口</figcaption></figure>"
+    "<figure><canvas id=b width=60 height=40></canvas>"
+    "<figcaption>右：逻辑图。白=地　黑=线　灰=不看。品红=竖线　绿=最低端</figcaption></figure>"
+    "</div>"
+    "<pre id=t>连接中...</pre>"
+    "<h3>判断逻辑</h3>"
+    "<ol>"
+    "<li>只看青框。有竖线就直行，用绿点（竖线最低端）相对上一扫描行的偏角做微调。</li>"
+    "<li>偏角小 → 小调；偏角大 → 大调。对标红外内侧灯 / 外侧灯。</li>"
+    "<li>左侧或右侧出现大横带、折线：只记住左转或右转，现在不转圈。</li>"
+    "<li>框里看不见黑线：按记忆方向三轮同速同向原地自转，直到竖线回来。</li>"
+    "</ol>"
+    "<script>"
+    "function paint(cv,pix,w,h){cv.width=w;cv.height=h;const ctx=cv.getContext('2d');"
+    "const im=ctx.createImageData(w,h);"
+    "for(let i=0;i<w*h;i++){const v=pix[i]||0;im.data[i*4]=v;im.data[i*4+1]=v;im.data[i*4+2]=v;im.data[i*4+3]=255;}"
+    "ctx.putImageData(im,0,0);return ctx;}"
+    "let busy=false;"
+    "async function tick(){"
+    "if(busy)return;busy=true;"
+    "try{"
+    "const r=await fetch('/snap');"
+    "if(!r.ok)throw new Error('HTTP '+r.status+' '+r.statusText);"
+    "const buf=new Uint8Array(await r.arrayBuffer());"
+    "const jl=buf[0]|buf[1]<<8;"
+    "const inf=JSON.parse(new TextDecoder().decode(buf.subarray(2,2+jl)));"
+    "const o=2+jl,w=buf[o]|buf[o+1]<<8,h=buf[o+2]|buf[o+3]<<8,n=w*h;"
+    "const orig=buf.subarray(o+4,o+4+n),bin=buf.subarray(o+4+n,o+4+2*n);"
+    "const c1=paint(document.getElementById('a'),orig,w,h);"
+    "const c2=paint(document.getElementById('b'),bin,w,h);"
+    "const r0=(inf.roi0|0),r1=(inf.roi1||w);"
+    "const yTop=inf.scan_y[inf.scan_y.length-1]||0,yBot=inf.scan_y[0]||h;"
+    "c1.strokeStyle='#0cf';c1.strokeRect(r0+0.5,yTop+0.5,Math.max(2,r1-r0),yBot-yTop);"
+    "c2.strokeStyle='#0cf';c2.strokeRect(r0+0.5,yTop+0.5,Math.max(2,r1-r0),yBot-yTop);"
+    "c2.strokeStyle='#cc0';"
+    "for(const y of inf.scan_y){c2.beginPath();c2.moveTo(r0,y+0.5);c2.lineTo(r1,y+0.5);c2.stroke();}"
+    "c2.strokeStyle='#f0f';c2.lineWidth=2;c2.beginPath();"
+    "if(inf.poly&&inf.poly.length){inf.poly.forEach((p,i)=>{i?c2.lineTo(p.x,p.y):c2.moveTo(p.x,p.y);});c2.stroke();}"
+    "c2.lineWidth=1;c2.strokeStyle='#f44';"
+    "for(const b of inf.blobs){c2.strokeRect(b.x-b.w/2,b.y-1,Math.max(2,b.w),3);}"
+    "function dot(ctx,x,y,c){if(x<0||y<0)return;ctx.fillStyle=c;ctx.beginPath();ctx.arc(x,y,3.5,0,6.28);ctx.fill();}"
+    "dot(c2,inf.near,inf.ny,'#0f0');dot(c2,inf.far,inf.fy,'#0ff');dot(c2,inf.kx,inf.ky,'#fa0');"
+    "const md=['直行 FOLLOW','自转 SPIN'][inf.md]||inf.md;"
+    "document.getElementById('t').textContent="
+    "'判定：'+inf.type+'    模式：'+md+'    记忆方向：'+inf.ldir+"
+    "'\\n最低端(绿) n='+inf.near+' 偏角 heading='+inf.heading+' 偏移 offset='+inf.offset+"
+    "'\\nstem='+inf.stem+'  kink='+inf.kink+'  L/R='+inf.L+'/'+inf.R+"
+    "'\\nvy='+inf.vy+' om='+inf.om+'  解码 '+inf.ms+'ms'"
+    "+'\\n\\n'+inf.hint;"
+    "}catch(e){document.getElementById('t').textContent='等待画面 '+e;}"
+    "busy=false;}"
+    "setInterval(tick,500);tick();"
+    "</script></body></html>";
+
+static void dbg_http_hdr(httpd_req_t *req, const char *type)
+{
+    httpd_resp_set_type(req, type);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+}
+
+static esp_err_t dbg_index_handler(httpd_req_t *req)
+{
+    dbg_http_hdr(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, DBG_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t dbg_ping_handler(httpd_req_t *req)
+{
+    dbg_http_hdr(req, "text/plain");
+    return httpd_resp_send(req, "ok", 2);
+}
+
+static bool dbg_copy_locked(char *json, int *json_len, uint8_t *gray, uint8_t *bin, int *w, int *h)
+{
+    if (!s_dbg_mutex || !s_dbg_gray || !s_dbg_bin || !s_dbg_ready) {
+        return false;
+    }
+    if (xSemaphoreTake(s_dbg_mutex, pdMS_TO_TICKS(40)) != pdTRUE) {
+        return false;
+    }
+    *json_len = s_dbg_json_len;
+    if (*json_len < 0) {
+        *json_len = 0;
+    }
+    if (*json_len > (int)sizeof(s_dbg_json)) {
+        *json_len = (int)sizeof(s_dbg_json);
+    }
+    memcpy(json, s_dbg_json, (size_t)*json_len);
+    *w = g_dbg_w;
+    *h = g_dbg_h;
+    if (*w > 0 && *h > 0) {
+        size_t n = (size_t)(*w) * (size_t)(*h);
+        if (gray) {
+            memcpy(gray, s_dbg_gray, n);
+        }
+        if (bin) {
+            memcpy(bin, s_dbg_bin, n);
+        }
+    }
+    xSemaphoreGive(s_dbg_mutex);
+    return *w > 0 && *h > 0 && *json_len > 2;
+}
+
+static esp_err_t dbg_snap_handler(httpd_req_t *req)
+{
+    static char json[4096];
+    static uint8_t *gray;
+    static uint8_t *bin;
+    if (!gray) {
+        gray = (uint8_t *)psram_alloc(CAM_WIDTH * CAM_HEIGHT);
+    }
+    if (!bin) {
+        bin = (uint8_t *)psram_alloc(CAM_WIDTH * CAM_HEIGHT);
+    }
+    int jl = 0, w = 0, h = 0;
+    if (!gray || !bin || !dbg_copy_locked(json, &jl, gray, bin, &w, &h)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        dbg_http_hdr(req, "text/plain");
+        return httpd_resp_send(req, "wait", 4);
+    }
+
+    size_t pix = (size_t)w * (size_t)h;
+    size_t total = 6 + (size_t)jl + pix * 2;
+    uint8_t *pkt = (uint8_t *)psram_alloc(total);
+    if (!pkt) {
+        return httpd_resp_send_500(req);
+    }
+    pkt[0] = (uint8_t)(jl & 0xff);
+    pkt[1] = (uint8_t)((jl >> 8) & 0xff);
+    memcpy(pkt + 2, json, (size_t)jl);
+    pkt[2 + jl] = (uint8_t)(w & 0xff);
+    pkt[3 + jl] = (uint8_t)((w >> 8) & 0xff);
+    pkt[4 + jl] = (uint8_t)(h & 0xff);
+    pkt[5 + jl] = (uint8_t)((h >> 8) & 0xff);
+    memcpy(pkt + 6 + jl, gray, pix);
+    memcpy(pkt + 6 + jl + pix, bin, pix);
+
+    dbg_http_hdr(req, "application/octet-stream");
+    esp_err_t r = httpd_resp_send(req, (const char *)pkt, (ssize_t)total);
+    free(pkt);
+    return r;
+}
+
+static void wifi_debug_start(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    esp_err_t el = esp_event_loop_create_default();
+    if (el != ESP_OK && el != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(el);
+    }
+    esp_netif_create_default_wifi_ap();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    wifi_config_t wifi_config = { 0 };
+    memcpy(wifi_config.ap.ssid, "CAM_LINE", 8);
+    wifi_config.ap.ssid_len = 8;
+    wifi_config.ap.channel = 1;
+    memcpy(wifi_config.ap.password, "12345678", 8);
+    wifi_config.ap.max_connection = 2;
+    wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.lru_purge_enable = true;
+    config.stack_size = 8192;
+    config.core_id = 1;
+    config.max_open_sockets = 4;
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP 启动失败");
+        return;
+    }
+    httpd_uri_t u0 = { .uri = "/", .method = HTTP_GET, .handler = dbg_index_handler };
+    httpd_uri_t u1 = { .uri = "/ping", .method = HTTP_GET, .handler = dbg_ping_handler };
+    httpd_uri_t u2 = { .uri = "/snap", .method = HTTP_GET, .handler = dbg_snap_handler };
+    httpd_register_uri_handler(server, &u0);
+    httpd_register_uri_handler(server, &u1);
+    httpd_register_uri_handler(server, &u2);
+    ESP_LOGI(TAG, "调试页: 连 WiFi CAM_LINE 密码 12345678，浏览器打开 http://192.168.4.1/");
+}
+
+static void follow_stem(const Sight *p)
+{
+    int dead = scaled_px(DEAD_PX_480);
+    int macro = scaled_px(MACRO_PX_480);
+    int err = p->angle;
+    if (abs(err) <= dead && abs(p->offset) > macro) {
+        err = p->offset;
+    }
+    if (abs(err) <= dead) {
+        drive(BASE_SPEED, 0.0f);
+        return;
+    }
+    float om = (abs(err) <= macro) ? OMEGA_MICRO : OMEGA_MACRO;
+    if (err < 0) {
+        om = -om;
+    }
+    drive(BASE_SPEED, om);
 }
 
 static void control_once(void)
 {
-    PathInfo p = classify_path();
+    Sight p = look();
 
-    /* 禁止左右瞬间对打：锁方向，反方向弯道当缓弯跟随 */
-    int64_t now_us = esp_timer_get_time();
-    if (now_us < g_dir_lock_until) {
-        if (g_dir_lock == LAST_DIR_LEFT && is_right_turn(p.type)) {
-            p.type = PATH_CURVE_LEFT;
-        } else if (g_dir_lock == LAST_DIR_RIGHT && is_left_turn(p.type)) {
-            p.type = PATH_CURVE_RIGHT;
-        }
-    } else if (is_sharp_turn(p.type)) {
-        g_dir_lock = is_left_turn(p.type) ? LAST_DIR_LEFT : LAST_DIR_RIGHT;
-        g_dir_lock_until = now_us + (int64_t)DIR_LOCK_MS * 1000;
-    }
-
-    if (!is_sharp_turn(p.type) && g_hold_frames > 0 && is_sharp_turn(g_hold_turn)) {
-        if (!(is_left_turn(p.type) && is_right_turn(g_hold_turn)) &&
-            !(is_right_turn(p.type) && is_left_turn(g_hold_turn))) {
-            p.type = g_hold_turn;
-            g_hold_frames--;
-        }
-    } else if (is_sharp_turn(p.type)) {
-        g_hold_turn = p.type;
-        g_hold_frames = HOLD_TURN_FRAMES;
-        g_slow_frames = SLOW_HOLD_FRAMES;
-    } else {
-        g_hold_frames = 0;
-        g_hold_turn = PATH_LOST;
-    }
-
-    if (p.type == PATH_CURVE_LEFT || p.type == PATH_CURVE_RIGHT ||
-        p.type == PATH_RIGHT_ANGLE_LEFT || p.type == PATH_RIGHT_ANGLE_RIGHT) {
-        g_slow_frames = SLOW_HOLD_FRAMES;
+    if (p.turn_left) {
+        g_last_dir = LAST_DIR_LEFT;
+    } else if (p.turn_right) {
+        g_last_dir = LAST_DIR_RIGHT;
     }
 
     static int64_t last_log = 0;
     int64_t now = esp_timer_get_time();
     if (now - last_log > 300000) {
-        ESP_LOGI(TAG, "%s n=%d f=%d h=%d LR=%d/%d md=%d vy=%.0f om=%.0f D=%.0f A=%.0f B=%.0f %dms",
-                 path_name(p.type), p.near_cx, p.far_cx, p.heading,
-                 p.left_mass, p.right_mass, (int)g_mode,
-                 g_last_vy, g_last_om, g_last_wheels.D, g_last_wheels.A, g_last_wheels.B,
-                 g_decode_ms);
+        ESP_LOGI(TAG, "%s stem=%d ang=%d off=%d LR=%d/%d turn=%s%s md=%d vy=%.0f om=%.0f %dms",
+                 view_name(p.type), p.stem_n, p.angle, p.offset, p.left_mass, p.right_mass,
+                 p.turn_left ? "L" : "", p.turn_right ? "R" : "",
+                 (int)g_mode, g_last_vy, g_last_om, g_decode_ms);
         last_log = now;
     }
 
-    if (p.type == PATH_LOST) {
+    if (p.type == VIEW_NONE) {
         g_lost_frames++;
-        if (g_lost_frames > LOST_STOP_FRAMES && g_mode != MODE_CORNER) {
+        if (g_lost_frames > LOST_STOP_FRAMES) {
             stop_motors();
             ESP_LOGE(TAG, "连续丢线，停车保护");
-            vTaskDelay(pdMS_TO_TICKS(80));
+            debug_update(&p);
             return;
         }
-        if (g_mode != MODE_CORNER) {
-            g_mode = MODE_SEARCH;
-        }
-    } else {
-        g_lost_frames = 0;
-    }
-
-    if (g_mode == MODE_CORNER) {
-        apply_corner(&p);
+        g_mode = MODE_SPIN;
+        spin_in_place(g_last_dir == LAST_DIR_LEFT);
+        debug_update(&p);
         return;
     }
 
-    if (p.type == PATH_RIGHT_ANGLE_LEFT || p.type == PATH_RIGHT_ANGLE_RIGHT) {
-        g_corner_hits++;
-        if (g_corner_hits < CORNER_CONFIRM_FRAMES) {
-            PathInfo tmp = p;
-            tmp.type = (p.type == PATH_RIGHT_ANGLE_LEFT) ? PATH_ACUTE_LEFT : PATH_ACUTE_RIGHT;
-            g_mode = MODE_FOLLOW;
-            apply_follow(&tmp);
-            return;
-        }
-        g_mode = MODE_CORNER;
-        g_corner_dir = p.type;
-        g_corner_t0 = now;
-        g_wrong_corner = 0;
-        remember_dir(&p);
-        apply_corner(&p);
-        return;
-    }
-    g_corner_hits = 0;
-
-    if (p.type == PATH_LOST || g_mode == MODE_SEARCH) {
-        if (p.type != PATH_LOST) {
-            g_mode = MODE_FOLLOW;
-            apply_follow(&p);
-        } else {
-            apply_search();
-        }
-        return;
-    }
-
+    g_lost_frames = 0;
     g_mode = MODE_FOLLOW;
-    apply_follow(&p);
+    if (p.type == VIEW_STEM) {
+        follow_stem(&p);
+    } else {
+        /* 只有横带：还看得见黑，先往前开，等丢线再转 */
+        drive(BASE_SPEED, 0.0f);
+    }
+    debug_update(&p);
 }
 
-/* ==================== UVC ==================== */
 static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
 {
     (void)ptr;
@@ -1067,8 +1091,9 @@ static bool camera_start(void)
     uint8_t *frame_buf = (uint8_t *)psram_alloc(JPEG_XFER_SIZE);
     s_jpeg = (uint8_t *)psram_alloc(JPEG_XFER_SIZE);
     s_gray = (uint8_t *)psram_alloc(CAM_WIDTH * CAM_HEIGHT);
+    s_bin = (uint8_t *)psram_alloc(CAM_WIDTH * CAM_HEIGHT);
 
-    if (!xfer_a || !xfer_b || !frame_buf || !s_jpeg || !s_gray) {
+    if (!xfer_a || !xfer_b || !frame_buf || !s_jpeg || !s_gray || !s_bin) {
         ESP_LOGE(TAG, "PSRAM 分配失败");
         return false;
     }
@@ -1119,7 +1144,6 @@ static void line_task(void *arg)
             }
             continue;
         }
-        /* 只处理最新一帧，丢掉积压，提高控制频率 */
         while (xSemaphoreTake(s_frame_ready, 0) == pdTRUE) {
         }
 
@@ -1138,11 +1162,9 @@ static void line_task(void *arg)
         int64_t t0 = esp_timer_get_time();
         if (!decode_mjpeg(local_jpg, (int)len)) {
             ESP_LOGW(TAG, "JPEG 解码失败 len=%u", (unsigned)len);
-            vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
         g_decode_ms = (int)((esp_timer_get_time() - t0) / 1000);
-
         control_once();
     }
 }
@@ -1163,15 +1185,21 @@ void app_main(void)
 
     s_frame_mutex = xSemaphoreCreateMutex();
     s_frame_ready = xSemaphoreCreateBinary();
+    s_dbg_mutex = xSemaphoreCreateMutex();
+    s_dbg_gray = (uint8_t *)psram_alloc(CAM_WIDTH * CAM_HEIGHT);
+    s_dbg_bin = (uint8_t *)psram_alloc(CAM_WIDTH * CAM_HEIGHT);
+    if (!s_dbg_gray || !s_dbg_bin) {
+        ESP_LOGW(TAG, "调试画面缓冲分配失败，网页将没有图像");
+    }
 
     motor_init();
     stop_motors();
+    wifi_debug_start();
 
     if (!camera_start()) {
         ESP_LOGE(TAG, "摄像头初始化失败");
         return;
     }
 
-    /* USB 在 core 1，循迹放 core 0，栈要给 JPEG 解码留足 */
-    xTaskCreatePinnedToCore(line_task, "line_follow", 12288, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(line_task, "line_follow", 12288, NULL, 6, NULL, 0);
 }
