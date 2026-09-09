@@ -200,6 +200,8 @@ static volatile uint32_t s_jpeg_len;
 static uint8_t *s_rgb;          /* RGB888 解码图 */
 static uint8_t *s_mask;         /* 当前颜色掩码 / 调试二值 */
 static uint8_t *s_visited;
+static uint8_t *s_jpeg_work;
+#define JPEG_RGB_WORK_SZ    (16 * 1024)
 static uint8_t *s_dbg_gray;
 static uint8_t *s_dbg_bin;
 static int s_img_w = CAM_WIDTH / 4;
@@ -594,7 +596,7 @@ static bool decode_mjpeg_rgb(const uint8_t *jpg, int len)
         return false;
     }
 
-    if (!s_rgb) {
+    if (!s_rgb || !s_jpeg_work) {
         return false;
     }
 
@@ -607,6 +609,10 @@ static bool decode_mjpeg_rgb(const uint8_t *jpg, int len)
         .out_scale = JPEG_IMAGE_SCALE_1_4,  /* 对应原 JPEG_DSCALE=2 */
         .flags = {
             .swap_color_bytes = 0,
+        },
+        .advanced = {
+            .working_buffer = s_jpeg_work,
+            .working_buffer_size = JPEG_RGB_WORK_SZ,
         },
     };
     esp_jpeg_image_output_t out = {0};
@@ -917,7 +923,7 @@ static bool find_best_blob(ColorId id, bool need_round, int min_a, int max_a, Bl
     int y0 = need_round ? ball_crop_y0() : 0;
     build_mask(id, y0);
     if (!need_round) {
-        dilate_mask(2);
+        dilate_mask(1);
     }
 
     BlobTarget cand;
@@ -1064,7 +1070,7 @@ static bool find_net_for_ball(const BlobTarget *ball, BlobTarget *best)
 {
     memset(best, 0, sizeof(*best));
     build_mask(COLOR_GREEN, 0);
-    dilate_mask(2);
+    dilate_mask(1);
 
     BlobTarget cands[MAX_CC_BLOBS];
     int n = 0;
@@ -1844,8 +1850,10 @@ static bool camera_start(void)
     s_rgb = (uint8_t *)psram_alloc(CAM_WIDTH * CAM_HEIGHT * 3);
     s_mask = (uint8_t *)psram_alloc(CAM_WIDTH * CAM_HEIGHT);
     s_visited = (uint8_t *)psram_alloc(CAM_WIDTH * CAM_HEIGHT);
+    s_jpeg_work = (uint8_t *)psram_alloc(JPEG_RGB_WORK_SZ);
 
-    if (!xfer_a || !xfer_b || !frame_buf || !s_jpeg || !s_rgb || !s_mask || !s_visited) {
+    if (!xfer_a || !xfer_b || !frame_buf || !s_jpeg || !s_rgb || !s_mask || !s_visited ||
+        !s_jpeg_work) {
         ESP_LOGE(TAG, "PSRAM 分配失败");
         return false;
     }
