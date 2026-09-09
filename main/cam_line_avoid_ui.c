@@ -140,7 +140,7 @@ static const char *TAG = "CAM_AVOID_UI";
 #define LOST_STOP_FRAMES    180
 
 #define STRAFE_SPEED        48.0f
-#define STRAFE_BACK_SPEED   48.0f   /* 与避障横移同一套轮速比例 */
+#define STRAFE_BACK_SPEED   38.0f   /* 与避障横移同一套轮速比例 */
 #define AVOID_TRIGGER_CM    10.0f
 #define AVOID_CLEAR_CM      13.0f
 #define STRAFE_FORCE_MS     800

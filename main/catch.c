@@ -93,12 +93,12 @@ static const char *TAG = "CAM_PUSH";
 #define STAGE_TIMEOUT_US    (18LL * 1000 * 1000)
 #define LOCK_HOLD_FRAMES    4
 #define STOP_HOLD_FRAMES    3
-#define ALIGN_HOLD_FRAMES   3
+#define ALIGN_HOLD_FRAMES   5
 #define COINCIDE_PX         8
 #define CENTER_DEAD_PX      6
 #define CENTER_MACRO_PX     18
-#define ALIGN_VERT_PX       6       /* 解码图上球-网 cx 差，视为几乎竖直 */
-#define ALIGN_OK_DEG        10.0f   /* 球-网连线相对竖直小于此角度则直行 */
+#define ALIGN_VERT_PX       4       /* 解码图上球-网 cx 差须同时满足 */
+#define ALIGN_OK_DEG        10.0f   /* 与 ALIGN_VERT_PX 同时满足才快射 */
 #define RETURN_LINE_MS      1500
 
 #define MAX_CC_BLOBS        12
@@ -1013,6 +1013,102 @@ done:
     return best->found;
 }
 
+/* 在已通过绿网形状过滤的块里，选和球同一侧且 |cx| 最近的门 */
+static bool pick_net_among(const BlobTarget *cands, int n, const BlobTarget *ball,
+                           BlobTarget *best)
+{
+    memset(best, 0, sizeof(*best));
+    if (n <= 0) {
+        return false;
+    }
+    if (!ball || !ball->found) {
+        int best_score = -1;
+        for (int i = 0; i < n; i++) {
+            int score = cands[i].area * (cands[i].mean_v + 1);
+            if (!best->found || score > best_score) {
+                *best = cands[i];
+                best_score = score;
+            }
+        }
+        return best->found;
+    }
+
+    int mid = s_img_w / 2;
+    bool prefer_left = (ball->cx < mid);
+    int best_i = -1;
+    int best_dx = 99999;
+    int best_cy = 99999;
+
+    for (int pass = 0; pass < 2 && best_i < 0; pass++) {
+        for (int i = 0; i < n; i++) {
+            bool same_half = prefer_left ? (cands[i].cx < mid) : (cands[i].cx >= mid);
+            if (pass == 0 && !same_half) {
+                continue;
+            }
+            int dx = abs(cands[i].cx - ball->cx);
+            if (dx < best_dx || (dx == best_dx && cands[i].cy < best_cy)) {
+                best_dx = dx;
+                best_cy = cands[i].cy;
+                best_i = i;
+            }
+        }
+    }
+    if (best_i < 0) {
+        return false;
+    }
+    *best = cands[best_i];
+    return true;
+}
+
+static bool find_net_for_ball(const BlobTarget *ball, BlobTarget *best)
+{
+    memset(best, 0, sizeof(*best));
+    build_mask(COLOR_GREEN, 0);
+    dilate_mask(2);
+
+    BlobTarget cands[MAX_CC_BLOBS];
+    int n = 0;
+    for (int y = 0; y < s_img_h; y++) {
+        for (int x = 0; x < s_img_w; x++) {
+            size_t i = (size_t)y * s_img_w + x;
+            if (!s_mask[i] || s_visited[i]) {
+                continue;
+            }
+            BlobTarget cand;
+            memset(&cand, 0, sizeof(cand));
+            if (!flood_blob(x, y, &cand)) {
+                continue;
+            }
+            if (cand.area < MIN_NET_AREA || cand.area > MAX_NET_AREA) {
+                continue;
+            }
+            int bw = cand.x1 - cand.x0 + 1;
+            int bh = cand.y1 - cand.y0 + 1;
+            float ar = (bw < bh) ? (float)bw / (float)bh : (float)bh / (float)bw;
+            if (ar < 0.22f && bw < (s_img_w / 8 + 1)) {
+                continue;
+            }
+            if (cand.mean_v < 50) {
+                continue;
+            }
+            if (bh * 10 >= bw * 20 && bw < (s_img_w * 17 / 100 + 1)) {
+                continue;
+            }
+            if (!(cand.mg >= cand.mr + 12 && cand.mg >= cand.mb + 8)) {
+                continue;
+            }
+            if (n < MAX_CC_BLOBS) {
+                cands[n++] = cand;
+            }
+            if (n >= MAX_CC_BLOBS) {
+                goto picked;
+            }
+        }
+    }
+picked:
+    return pick_net_among(cands, n, ball, best);
+}
+
 static bool detect_black_line(int *cx_out)
 {
     build_mask(COLOR_BLACK, 0);
@@ -1067,7 +1163,7 @@ static bool line_almost_vertical(const FrameSight *p)
         return false;
     }
     int ldx = p->net.cx - p->ball.cx;
-    return (fabsf(p->align_deg) <= ALIGN_OK_DEG) || (abs(ldx) <= ALIGN_VERT_PX);
+    return (fabsf(p->align_deg) <= ALIGN_OK_DEG) && (abs(ldx) <= ALIGN_VERT_PX);
 }
 
 static int balls_done(void)
@@ -1109,10 +1205,6 @@ static void analyze_frame(FrameSight *out)
     vTaskDelay(0);
     find_best_blob(COLOR_BLUE, true, MIN_BALL_AREA, MAX_BALL_AREA, &out->blue);
     vTaskDelay(0);
-    find_best_blob(COLOR_GREEN, false, MIN_NET_AREA, MAX_NET_AREA, &out->net);
-    if (g_state == ST_SEARCH_BLACK || g_state == ST_RETURN_END) {
-        out->has_black_line = detect_black_line(&out->black_cx);
-    }
 
     if (g_state == ST_SEARCH_BALL || g_state == ST_IDLE) {
         pick_search_target(out);
@@ -1120,6 +1212,11 @@ static void analyze_frame(FrameSight *out)
         out->ball = out->red;
     } else {
         out->ball = out->blue;
+    }
+
+    find_net_for_ball(out->ball.found ? &out->ball : NULL, &out->net);
+    if (g_state == ST_SEARCH_BLACK || g_state == ST_RETURN_END) {
+        out->has_black_line = detect_black_line(&out->black_cx);
     }
 
     if (out->ball.found && out->net.found) {
@@ -1175,6 +1272,19 @@ static int center_dead_px(void)
 static int center_macro_px(void)
 {
     return scaled_px(CENTER_MACRO_PX * CAM_WIDTH / 60);
+}
+
+static bool ball_on_center(const FrameSight *p)
+{
+    if (!p || !p->ball.found) {
+        return false;
+    }
+    return abs(p->ball.cx - s_img_w / 2) <= center_dead_px() + 2;
+}
+
+static bool ready_to_shoot(const FrameSight *p)
+{
+    return line_almost_vertical(p) && ball_on_center(p);
 }
 
 /* ==================== 运动辅助 ==================== */
@@ -1610,8 +1720,8 @@ static void control_once(void)
                 ESP_LOGI(TAG, "停在球前 d=%.1fcm cx=%d cy=%d，开始对齐",
                          d, p->ball.cx, p->ball.cy);
                 g_locked_ball = p->ball;
-                if (line_almost_vertical(p)) {
-                    ESP_LOGI(TAG, "连线 %.1f° 已小于10°，快速撞球 %.0fms", p->align_deg, (float)PUSH_MS);
+                if (ready_to_shoot(p)) {
+                    ESP_LOGI(TAG, "连线 %.1f° 已对准且球居中，快速撞球 %.0fms", p->align_deg, (float)PUSH_MS);
                     enter_state(ST_PUSH);
                     drive(PUSH_SPEED, 0.0f);
                 } else {
@@ -1643,18 +1753,23 @@ static void control_once(void)
             break;
         }
         int ldx = p->net.cx - p->ball.cx;
-        if (line_almost_vertical(p)) {
+        if (ready_to_shoot(p)) {
             stop_motors();
             g_lock_frames++;
             g_orbit_dir_valid = false;
             if (g_lock_frames >= ALIGN_HOLD_FRAMES) {
-                ESP_LOGI(TAG, "连线 %.1f° ldx=%d，快速撞球 %.0fms", p->align_deg, ldx, (float)PUSH_MS);
+                ESP_LOGI(TAG, "连线 %.1f° ldx=%d 球居中，快速撞球 %.0fms",
+                         p->align_deg, ldx, (float)PUSH_MS);
                 enter_state(ST_PUSH);
                 drive(PUSH_SPEED, 0.0f);
             }
         } else {
             g_lock_frames = 0;
-            pulse_orbit_around_front(align_orbit_left(ldx));
+            if (line_almost_vertical(p) && !ball_on_center(p)) {
+                pulse_center_on_x(p->ball.cx, 0.0f);
+            } else {
+                pulse_orbit_around_front(align_orbit_left(ldx));
+            }
         }
         break;
     }
