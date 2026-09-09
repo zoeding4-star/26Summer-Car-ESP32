@@ -1,0 +1,40 @@
+# ==================== USB Host / UVC 摄像头关键配置 ====================
+# 1) 枚举时读取配置描述符的控制传输上限。
+#    JQ-CAM12-720P 这类 720P UVC 摄像头的配置描述符很大(超过 256 字节)，
+#    默认 256 会导致枚举失败：
+#      E ENUM: Configuration descriptor larger than control transfer max length
+#    官方 usb_host/uvc 示例即使用 3000。
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=3000
+
+# 2) UVC 摄像头是纯"IN"方向数据流(等时/中断传输都是 IN)，
+#    把 USB 硬件缓冲区偏向 IN 端点可提升 UVC 收流稳定性(官方示例配置)。
+CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
+# CONFIG_USB_HOST_HW_BUFFER_BIAS_BALANCED is not set
+
+# ==================== PSRAM 配置 ====================
+# 开发板: ESP32-S3-DevKitC-1 (N32R16V 模组: 32MB OPI Flash + 16MB Octal PSRAM)
+# 开启 PSRAM 后，libuvc 的大块帧缓冲(malloc 超过 16KB)会自动落到 PSRAM，
+# 这样才能流畅跑 320x240 / 640x480 的 YUYV 流(160x120 也更有余量)。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+# 若 PSRAM 配置异常，不至于开机 panic，而是忽略 PSRAM 继续启动(安全兜底)
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+# 让普通 malloc() 也能分配 PSRAM(libuvc 内部用的就是 malloc)
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# 给任务栈 / USB DMA 等必须留在内部 RAM 的分配预留 150KB(官方 UVC 示例值)
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=150000
+# 16MB PSRAM 为 Octal 模式
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# ==================== Flash 容量 ====================
+# 实际模组是 32MB OPI Flash，修正后消除启动警告:
+#   W spi_flash: Detected size(32768k) larger than the size in the binary image header(2048k)
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
+
+# LVGL + 摄像头固件超过 1MB 默认分区
+# CONFIG_PARTITION_TABLE_SINGLE_APP is not set
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

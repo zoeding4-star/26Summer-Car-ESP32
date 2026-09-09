@@ -1,5 +1,8 @@
 ## IDF Component Manager Manifest File
 dependencies:
+  lvgl/lvgl: "^8.3.11"
+  espressif/usb_stream: "^1.0.0"
+  espressif/usb_host_uvc: "^1.0.0"
   ## Required IDF version
   idf:
     version: '>=4.1.0'
@@ -15,3 +18,4 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/led_strip: ^3.0.3
+  espressif/esp_jpeg: "^1.2.1"
