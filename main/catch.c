@@ -1,5 +1,6 @@
 /**
  * 推球入网：红蓝各推一次，先看到哪个推哪个，计满 2 个结束。
+ * 对准后快速撞击 0.5s，再匀速倒退 3s；不根据球–网距离判断进球。
  */
 
 #include <stdio.h>
@@ -55,22 +56,30 @@ static const char *TAG = "CAM_PUSH";
 
 #define BASE_SPEED      46.0f
 #define APPROACH_SPEED  40.0f   /* 点动脉冲幅值，不是连续走 */
-#define PUSH_SPEED      32.0f   /* 推球：缓慢匀速 */
-#define BACKUP_SPEED    36.0f
+#define PUSH_SPEED      64.0f   /* 快速撞球 */
+#define BACKUP_SPEED    36.0f   /* 匀速倒退 */
 #define OMEGA_MICRO     12.0f
 #define OMEGA_MACRO     18.0f
 #define ROT_MAX         22.0f
 #define SPIN_PWM        42.0f   /* 点动转的脉冲幅值，要能克服静摩擦 */
-#define PIVOT_PWM       42.0f
+/* 仅 ST_ALIGN 两个 pivot 使用，与 orbit_test.c 一致，勿改搜球/对中宏 */
+#define CATCH_ORBIT_SIN60       0.8660254f
+#define CATCH_ORBIT_SCALE_D     0.4f
+#define CATCH_ORBIT_SCALE_A     0.4f
+#define CATCH_ORBIT_SCALE_B     3.0f
+#define CATCH_ORBIT_B_BOOST     1.00f
+#define CATCH_ORBIT_VX          66.0f
+#define CATCH_ORBIT_PULSE_MS    70
+#define CATCH_ORBIT_BRAKE_MS    5       /* 仅绕球点动；勿改搜球制动 */
 #define PULSE_ON_MS     120     /* 点动时长 ×4 */
 #define PULSE_SPIN_ON_MS 20     /* 搜球/对中：真 20ms 后立刻停，再看下一帧 */
 #define PULSE_BACKUP_ON_MS 220  /* 后退每下比靠近走得更远 */
 #define PULSE_OFF_MS    80      /* 前进/后退点动间隔；搜球不等这段 */
 #define PULSE_BRAKE_SCALE 0.32f /* 反向制动幅值，低于起步静摩擦 */
 #define PULSE_BRAKE_MAX_MS 24   /* 制动必须远短于正向，避免反走 */
-#define BACKUP_MS       6000
+#define PUSH_MS         500     /* 快速撞击时长 */
+#define BACKUP_MS       3000    /* 匀速倒退时长 */
 #define APPROACH_STOP_CM 8.0f
-#define PUSH_OK_CM      6.0f
 
 /* ==================== 摄像头 ==================== */
 #define CAM_WIDTH           480
@@ -85,7 +94,6 @@ static const char *TAG = "CAM_PUSH";
 #define LOCK_HOLD_FRAMES    4
 #define STOP_HOLD_FRAMES    3
 #define ALIGN_HOLD_FRAMES   3
-#define PUSH_OK_HOLD        3
 #define COINCIDE_PX         8
 #define CENTER_DEAD_PX      6
 #define CENTER_MACRO_PX     18
@@ -169,7 +177,6 @@ static int g_lock_frames = 0;
 static int64_t g_backup_until = 0;
 static int64_t g_pulse_ready_at = 0;
 static int g_stop_hold = 0;
-static int g_push_ok_hold = 0;
 static int g_decode_ms = 0;
 static MotorSpeed g_last_wheels = {0, 0, 0};
 static float g_last_vy = 0.0f;
@@ -180,6 +187,10 @@ static bool g_done_red = false;
 static bool g_done_blue = false;
 static float g_last_d_ball = -1.0f;
 static float g_last_d_net = -1.0f;
+static bool g_orbit_dir_valid = false;
+static bool g_orbit_left = true;
+static int g_last_abs_ldx = -1;
+static int g_orbit_worse_frames = 0;
 
 static SemaphoreHandle_t s_frame_mutex;
 static SemaphoreHandle_t s_frame_ready;
@@ -424,24 +435,70 @@ static void spin_in_place(bool left)
     pulse_apply_ms(&m, PULSE_SPIN_ON_MS, 0);
 }
 
-/* 绕左轮 D 逆时针：左轮不动，A、B 与原地左转同向 */
-static void pulse_pivot_ccw_on_left(void)
+/* 绕车头前方点公转，配速与 orbit_test.c 的 catch_orbit_cmd 相同 */
+static MotorSpeed catch_orbit_cmd(bool left)
 {
-    float s = clampf(PIVOT_PWM, 0.0f, (float)PWM_CAP);
-    MotorSpeed m = { 0.0f, s, -s };
-    g_last_vy = 0.0f;
-    g_last_om = -s;
-    pulse_apply_ms(&m, PULSE_SPIN_ON_MS, 0);
+    float vx = left ? CATCH_ORBIT_VX : -CATCH_ORBIT_VX;
+    MotorSpeed m;
+    m.D = clampf(-CATCH_ORBIT_SIN60 * vx * CATCH_ORBIT_SCALE_D, -(float)PWM_CAP, (float)PWM_CAP);
+    m.A = clampf( CATCH_ORBIT_SIN60 * vx * CATCH_ORBIT_SCALE_A, -(float)PWM_CAP, (float)PWM_CAP);
+    m.B = clampf(vx * CATCH_ORBIT_SCALE_B * CATCH_ORBIT_B_BOOST,
+                 -(float)PWM_CAP, (float)PWM_CAP);
+    return m;
 }
 
-/* 绕右轮 A 顺时针：右轮不动 */
-static void pulse_pivot_cw_on_right(void)
+/* 仅 ST_ALIGN：70ms 通电 + 固定 5ms 反刹，不走 pulse_apply_ms */
+static void pulse_orbit_around_front(bool left)
 {
-    float s = clampf(PIVOT_PWM, 0.0f, (float)PWM_CAP);
-    MotorSpeed m = { s, 0.0f, s };
+    MotorSpeed m = catch_orbit_cmd(left);
     g_last_vy = 0.0f;
-    g_last_om = s;
-    pulse_apply_ms(&m, PULSE_SPIN_ON_MS, 0);
+    g_last_om = m.B;
+    g_last_wheels = m;
+
+    int64_t now = esp_timer_get_time();
+    if (now < g_pulse_ready_at) {
+        stop_motors();
+        return;
+    }
+
+    int on_ms = CATCH_ORBIT_PULSE_MS;
+    if (on_ms < 1) {
+        on_ms = 1;
+    }
+    set_all_motors(&m);
+    wait_pulse_us((int64_t)on_ms * 1000);
+
+    MotorSpeed brk = pulse_brake_cmd(&m);
+    set_all_motors(&brk);
+    wait_pulse_us((int64_t)CATCH_ORBIT_BRAKE_MS * 1000);
+
+    stop_motors();
+    g_last_wheels = m;
+    g_pulse_ready_at = 0;
+}
+
+/* |ldx| 变小则保持原方向；连续变大才按 ldx 符号改向 */
+static bool align_orbit_left(int ldx)
+{
+    int al = abs(ldx);
+    bool want_left = (ldx < 0);
+    if (!g_orbit_dir_valid) {
+        g_orbit_left = want_left;
+        g_orbit_dir_valid = true;
+        g_orbit_worse_frames = 0;
+    } else if (g_last_abs_ldx >= 0) {
+        if (al < g_last_abs_ldx) {
+            g_orbit_worse_frames = 0;
+        } else if (al > g_last_abs_ldx) {
+            g_orbit_worse_frames++;
+            if (g_orbit_worse_frames >= 2) {
+                g_orbit_left = want_left;
+                g_orbit_worse_frames = 0;
+            }
+        }
+    }
+    g_last_abs_ldx = al;
+    return g_orbit_left;
 }
 
 static void enter_state(PushState st)
@@ -451,8 +508,12 @@ static void enter_state(PushState st)
                  state_name(g_state), state_name(st), ball_name(g_ball_kind));
         g_pulse_ready_at = 0;
         g_stop_hold = 0;
-        g_push_ok_hold = 0;
         g_lock_frames = 0;
+        if (st == ST_ALIGN) {
+            g_orbit_dir_valid = false;
+            g_last_abs_ldx = -1;
+            g_orbit_worse_frames = 0;
+        }
     }
     g_state = st;
     g_stage_t0 = esp_timer_get_time();
@@ -1550,7 +1611,7 @@ static void control_once(void)
                          d, p->ball.cx, p->ball.cy);
                 g_locked_ball = p->ball;
                 if (line_almost_vertical(p)) {
-                    ESP_LOGI(TAG, "连线 %.1f° 已小于10°，直接直行推球", p->align_deg);
+                    ESP_LOGI(TAG, "连线 %.1f° 已小于10°，快速撞球 %.0fms", p->align_deg, (float)PUSH_MS);
                     enter_state(ST_PUSH);
                     drive(PUSH_SPEED, 0.0f);
                 } else {
@@ -1585,44 +1646,24 @@ static void control_once(void)
         if (line_almost_vertical(p)) {
             stop_motors();
             g_lock_frames++;
+            g_orbit_dir_valid = false;
             if (g_lock_frames >= ALIGN_HOLD_FRAMES) {
-                ESP_LOGI(TAG, "连线 %.1f° ldx=%d，开始匀速直行", p->align_deg, ldx);
+                ESP_LOGI(TAG, "连线 %.1f° ldx=%d，快速撞球 %.0fms", p->align_deg, ldx, (float)PUSH_MS);
                 enter_state(ST_PUSH);
                 drive(PUSH_SPEED, 0.0f);
             }
         } else {
             g_lock_frames = 0;
-            if (p->align_deg < 0.0f || ldx < 0) {
-                /* 连线往左偏：绕左轮逆时针 */
-                pulse_pivot_ccw_on_left();
-            } else {
-                pulse_pivot_cw_on_right();
-            }
+            pulse_orbit_around_front(align_orbit_left(ldx));
         }
         break;
     }
 
     case ST_PUSH: {
-        if (p->ball.found && p->net.found) {
-            float nd = dist_ball_net_cm(&p->ball, &p->net);
-            int dx = p->ball.cx - p->net.cx;
-            int dy = p->ball.cy - p->net.cy;
-            int overlap = p->ball.radius + 3;
-            bool close_ok = (nd <= PUSH_OK_CM) ||
-                            (dx * dx + dy * dy <= overlap * overlap);
-            if (close_ok) {
-                g_push_ok_hold++;
-                stop_motors();
-                if (g_push_ok_hold >= PUSH_OK_HOLD) {
-                    ESP_LOGI(TAG, "推球成功 nd=%.1fcm dx=%d dy=%d", nd, dx, dy);
-                    on_push_success();
-                }
-                break;
-            }
-            g_push_ok_hold = 0;
-            drive(PUSH_SPEED, 0.0f);
+        if (esp_timer_get_time() - g_stage_t0 >= (int64_t)PUSH_MS * 1000) {
+            ESP_LOGI(TAG, "撞击 %.0fms 结束，匀速倒退 %.0fms", (float)PUSH_MS, (float)BACKUP_MS);
+            on_push_success();
         } else {
-            /* 球可能已被车头挡住：保持匀速直行 */
             drive(PUSH_SPEED, 0.0f);
         }
         break;
@@ -1632,7 +1673,7 @@ static void control_once(void)
         if (esp_timer_get_time() >= g_backup_until) {
             after_backup();
         } else {
-            pulse_drive_ms(-BACKUP_SPEED, 0.0f, PULSE_BACKUP_ON_MS);
+            drive(-BACKUP_SPEED, 0.0f);
         }
         break;
 

@@ -35,23 +35,23 @@
 #                        REQUIRES esp_driver_pcnt esp_driver_gpio led_strip esp_driver_spi esp_driver_ledc esp_timer esp_lcd lvgl)   
 
 # 推球入网（catch.c，彩色 JPEG 解码用 esp_jpeg）
-# idf_component_register(
-#     SRCS "catch.c"
-#     INCLUDE_DIRS "."
-#     REQUIRES
-#         driver
-#         freertos
-#         usb
-#         usb_stream
-#         nvs_flash
-#         esp_psram
-#         esp_timer
-#         esp_wifi
-#         esp_event
-#         esp_netif
-#         esp_http_server
-#         esp_jpeg
-# )
+idf_component_register(
+    SRCS "catch.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        driver
+        freertos
+        usb
+        usb_stream
+        nvs_flash
+        esp_psram
+        esp_timer
+        esp_wifi
+        esp_event
+        esp_netif
+        esp_http_server
+        esp_jpeg
+)
 
 # 编译 MPU6500 测试
 # idf_component_register(
@@ -93,27 +93,27 @@
 # )
 
 # 全程：循迹避障 + 停 3 秒 + 推球（屏幕）
-idf_component_register(
-    SRCS "cam_final.c"
-    INCLUDE_DIRS "."
-    REQUIRES
-        driver
-        freertos
-        usb
-        usb_stream
-        nvs_flash
-        esp_psram
-        esp_timer
-        esp_wifi
-        esp_event
-        esp_netif
-        esp_http_server
-        esp_driver_pcnt
-        esp_driver_spi
-        esp_lcd
-        lvgl
-        esp_jpeg
-)
+# idf_component_register(
+#     SRCS "cam_final.c"
+#     INCLUDE_DIRS "."
+#     REQUIRES
+#         driver
+#         freertos
+#         usb
+#         usb_stream
+#         nvs_flash
+#         esp_psram
+#         esp_timer
+#         esp_wifi
+#         esp_event
+#         esp_netif
+#         esp_http_server
+#         esp_driver_pcnt
+#         esp_driver_spi
+#         esp_lcd
+#         lvgl
+#         esp_jpeg
+# )
 
 # 摄像头循迹 + 超声波避障 + 屏幕转速/距离
 # idf_component_register(
