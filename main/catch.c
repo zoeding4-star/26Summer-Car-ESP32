@@ -72,7 +72,9 @@ static const char *TAG = "CAM_PUSH";
 #define CATCH_ORBIT_PULSE_MS    70
 #define CATCH_ORBIT_BRAKE_MS    5       /* 仅绕球点动；勿改搜球制动 */
 #define PULSE_ON_MS     120     /* 点动时长 ×4 */
-#define PULSE_SPIN_ON_MS 20     /* 搜球/对中：真 20ms 后立刻停，再看下一帧 */
+#define PULSE_SPIN_ON_MS 20     /* 对中/丢球等：20ms 后立刻停 */
+#define SEARCH_SPIN_ON_MS 50    /* 仅 ST_SEARCH_BALL 找球 */
+#define SEARCH_SPIN_BRAKE_MS 5
 #define PULSE_BACKUP_ON_MS 220  /* 后退每下比靠近走得更远 */
 #define PULSE_OFF_MS    80      /* 前进/后退点动间隔；搜球不等这段 */
 #define PULSE_BRAKE_SCALE 0.32f /* 反向制动幅值，低于起步静摩擦 */
@@ -435,6 +437,31 @@ static void spin_in_place(bool left)
     g_last_om = s;
     /* 转完立刻停，下一帧再判断，避免连转大半圈 */
     pulse_apply_ms(&m, PULSE_SPIN_ON_MS, 0);
+}
+
+/* 仅找球：50ms 通电 + 固定 5ms 反刹。其它原地转仍走 spin_in_place。 */
+static void spin_search_ball(bool left)
+{
+    float s = left ? -SPIN_PWM : SPIN_PWM;
+    s = clampf(s, -(float)PWM_CAP, (float)PWM_CAP);
+    MotorSpeed m = { s, -s, s };
+    g_last_vy = 0.0f;
+    g_last_om = s;
+    g_last_wheels = m;
+
+    int64_t now = esp_timer_get_time();
+    if (now < g_pulse_ready_at) {
+        stop_motors();
+        return;
+    }
+    set_all_motors(&m);
+    wait_pulse_us((int64_t)SEARCH_SPIN_ON_MS * 1000);
+    MotorSpeed brk = pulse_brake_cmd(&m);
+    set_all_motors(&brk);
+    wait_pulse_us((int64_t)SEARCH_SPIN_BRAKE_MS * 1000);
+    stop_motors();
+    g_last_wheels = m;
+    g_pulse_ready_at = 0;
 }
 
 /* 绕车头前方点公转，配速与 orbit_test.c 的 catch_orbit_cmd 相同 */
@@ -1655,7 +1682,7 @@ static void after_backup(void)
     }
     ESP_LOGI(TAG, "后退结束，点动找下一颗球");
     enter_state(ST_SEARCH_BALL);
-    spin_in_place(true);
+    spin_search_ball(true);
 }
 
 static void control_once(void)
@@ -1706,7 +1733,7 @@ static void control_once(void)
             stop_motors();
             enter_state(ST_APPROACH_BALL);
         } else {
-            spin_in_place(true);
+            spin_search_ball(true);
         }
         break;
 
@@ -1901,7 +1928,7 @@ static void push_task(void *arg)
     stop_motors();
     vTaskDelay(pdMS_TO_TICKS(500));
     enter_state(ST_SEARCH_BALL);
-    spin_in_place(true);
+    spin_search_ball(true);
 
     while (1) {
         if (xSemaphoreTake(s_frame_ready, pdMS_TO_TICKS(200)) != pdTRUE) {
@@ -1915,7 +1942,11 @@ static void push_task(void *arg)
                 if (g_state == ST_IDLE) {
                     enter_state(ST_SEARCH_BALL);
                 }
-                spin_in_place(true);
+                if (g_state == ST_SEARCH_BALL) {
+                    spin_search_ball(true);
+                } else {
+                    spin_in_place(true);
+                }
             }
             continue;
         }

@@ -1699,7 +1699,9 @@ static void control_once(void)
 #define CATCH_ORBIT_PULSE_MS    70
 #define CATCH_ORBIT_BRAKE_MS    5       /* 仅绕球点动；勿改搜球制动 */
 #define PULSE_ON_MS     120     /* 点动时长 ×4 */
-#define PULSE_SPIN_ON_MS 20     /* 搜球/对中：真 20ms 后立刻停，再看下一帧 */
+#define PULSE_SPIN_ON_MS 20     /* 对中/丢球等：20ms 后立刻停 */
+#define SEARCH_SPIN_ON_MS 50    /* 仅 ST_SEARCH_BALL 找球 */
+#define SEARCH_SPIN_BRAKE_MS 5
 #define PULSE_BACKUP_ON_MS 220  /* 后退每下比靠近走得更远 */
 #define PULSE_OFF_MS    80      /* 前进/后退点动间隔；搜球不等这段 */
 #define PULSE_BRAKE_SCALE 0.32f /* 反向制动幅值，低于起步静摩擦 */
@@ -1707,7 +1709,6 @@ static void control_once(void)
 #define PUSH_MS         500     /* 快速撞击时长 */
 #define BACKUP_MS       3000    /* 匀速倒退时长 */
 #define APPROACH_STOP_CM 8.0f
-
 #define STAGE_TIMEOUT_US    (18LL * 1000 * 1000)
 #define LOCK_HOLD_FRAMES    4
 #define STOP_HOLD_FRAMES    3
@@ -1732,6 +1733,7 @@ static void control_once(void)
 #define BALL_FAR_CROP_NUM   1       /* 找球时丢掉画面上方 1/8（远方） */
 #define BALL_FAR_CROP_DEN   8
 #define NEAR_Y_PCT          70      /* cy 超过画面 70% 视为贴到车头 */
+#define NEAR_HOLD_FRAMES    4
 
 typedef enum {
     BALL_RED = 0,
@@ -1802,7 +1804,6 @@ static int g_orbit_worse_frames = 0;
 static FrameSight g_dbg_sight;
 static PushState g_dbg_state;
 static BallKind g_dbg_kind;
-
 static const char *state_name(PushState s)
 {
     switch (s) {
@@ -1827,6 +1828,7 @@ static const char *ball_name(BallKind k)
     return (k == BALL_RED) ? "RED" : "BLUE";
 }
 
+/* ==================== 电机 ==================== */
 static MotorSpeed catch_make_drive(float vy, float omega)
 {
     float fwd = 0.0f;
@@ -1881,7 +1883,7 @@ static void wait_pulse_us(int64_t us)
 {
     int64_t t0 = esp_timer_get_time();
     while (esp_timer_get_time() - t0 < us) {
-        vTaskDelay(0);
+        vTaskDelay(1);
     }
 }
 
@@ -1939,6 +1941,31 @@ static void catch_spin_in_place(bool left)
     g_last_om = s;
     /* 转完立刻停，下一帧再判断，避免连转大半圈 */
     pulse_apply_ms(&m, PULSE_SPIN_ON_MS, 0);
+}
+
+/* 仅找球：50ms 通电 + 固定 5ms 反刹。其它原地转仍走 catch_spin_in_place。 */
+static void catch_spin_search_ball(bool left)
+{
+    float s = left ? -CATCH_SPIN_PWM : CATCH_SPIN_PWM;
+    s = clampf(s, -(float)PWM_CAP, (float)PWM_CAP);
+    MotorSpeed m = { s, -s, s };
+    g_last_vy = 0.0f;
+    g_last_om = s;
+    g_last_wheels = m;
+
+    int64_t now = esp_timer_get_time();
+    if (now < g_pulse_ready_at) {
+        stop_motors();
+        return;
+    }
+    set_all_motors(&m);
+    wait_pulse_us((int64_t)SEARCH_SPIN_ON_MS * 1000);
+    MotorSpeed brk = pulse_brake_cmd(&m);
+    set_all_motors(&brk);
+    wait_pulse_us((int64_t)SEARCH_SPIN_BRAKE_MS * 1000);
+    stop_motors();
+    g_last_wheels = m;
+    g_pulse_ready_at = 0;
 }
 
 /* 绕车头前方点公转，配速与 orbit_test.c 的 catch_orbit_cmd 相同 */
@@ -2026,7 +2053,6 @@ static void enter_state(PushState st)
     g_state = st;
     g_stage_t0 = esp_timer_get_time();
 }
-
 static void rgb_at(int x, int y, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     int mx = map_x(x, s_img_w);
@@ -2037,8 +2063,7 @@ static void rgb_at(int x, int y, uint8_t *r, uint8_t *g, uint8_t *b)
     *b = p[2];
 }
 
-/* UVC MJPEG 常省略 DHT。彩色走 esp_jpeg（软件 tjpgd + 默认 Huffman）。
- * 循迹灰度走 cam_jd_prepare，不能和 esp_jpeg 共用 jd_prepare 符号。 */
+/* UVC MJPEG 常省略 DHT；必须用软件 esp_jpeg + 默认 Huffman，不能用 ROM tjpgd */
 static bool jpeg_clip_soi_eoi(const uint8_t *jpg, int len, int *off, int *out_len)
 {
     int start = -1;
@@ -2062,12 +2087,6 @@ static bool jpeg_clip_soi_eoi(const uint8_t *jpg, int len, int *off, int *out_le
     /* 个别帧缺 EOI：仍尝试解码剩余数据 */
     *out_len = (end > start) ? (end - start) : (len - start);
     return *out_len >= 128;
-}
-
-/* 本任务必须先 esp_task_wdt_add。vTaskDelay(0) 让不出 IDLE，喂不了 IDLE0 看门狗。 */
-static void pet_wdt(void)
-{
-    (void)esp_task_wdt_reset();
 }
 
 static bool decode_mjpeg_rgb(const uint8_t *jpg, int len)
@@ -2106,10 +2125,10 @@ static bool decode_mjpeg_rgb(const uint8_t *jpg, int len)
     };
     esp_jpeg_image_output_t out = {0};
 
-    pet_wdt();
+    (void)esp_task_wdt_reset();
     vTaskDelay(1);
     esp_err_t err = esp_jpeg_decode(&cfg, &out);
-    pet_wdt();
+    (void)esp_task_wdt_reset();
     vTaskDelay(1);
     if (err != ESP_OK) {
         static int n;
@@ -2211,8 +2230,8 @@ static void build_mask(ColorId id, int y0)
         y0 = 0;
     }
     for (int y = y0; y < s_img_h; y++) {
-        if ((y & 7) == 0) {
-            pet_wdt();
+        if ((y & 15) == 0) {
+            vTaskDelay(0);
         }
         for (int x = 0; x < s_img_w; x++) {
             uint8_t r, g, b;
@@ -2253,9 +2272,6 @@ static bool flood_blob(int sx, int sy, BlobTarget *out)
     while (sp > 0) {
         Pt16 p = stack[--sp];
         area++;
-        if ((area & 511) == 0) {
-            pet_wdt();
-        }
         sumx += p.x;
         sumy += p.y;
         {
@@ -2333,7 +2349,7 @@ static void dilate_mask(int times)
         memcpy(s_visited, s_mask, (size_t)np);
         for (int y = 0; y < h; y++) {
             if ((y & 7) == 0) {
-                pet_wdt();
+                vTaskDelay(0);
             }
             for (int x = 0; x < w; x++) {
                 size_t i = (size_t)y * w + x;
@@ -2437,9 +2453,6 @@ static bool find_best_blob(ColorId id, bool need_round, int min_a, int max_a, Bl
         ar_min = 0.45f;
     }
     for (int y = y0; y < s_img_h; y++) {
-        if ((y & 7) == 0) {
-            pet_wdt();
-        }
         for (int x = 0; x < s_img_w; x++) {
             size_t i = (size_t)y * s_img_w + x;
             if (!s_mask[i] || s_visited[i]) {
@@ -2577,9 +2590,6 @@ static bool find_net_for_ball(const BlobTarget *ball, BlobTarget *best)
     BlobTarget cands[MAX_CC_BLOBS];
     int n = 0;
     for (int y = 0; y < s_img_h; y++) {
-        if ((y & 7) == 0) {
-            pet_wdt();
-        }
         for (int x = 0; x < s_img_w; x++) {
             size_t i = (size_t)y * s_img_w + x;
             if (!s_mask[i] || s_visited[i]) {
@@ -2713,11 +2723,9 @@ static void analyze_frame(FrameSight *out)
 {
     memset(out, 0, sizeof(*out));
     find_best_blob(COLOR_RED, true, MIN_BALL_AREA, MAX_BALL_AREA, &out->red);
-    pet_wdt();
-    vTaskDelay(1);
+    vTaskDelay(0);
     find_best_blob(COLOR_BLUE, true, MIN_BALL_AREA, MAX_BALL_AREA, &out->blue);
-    pet_wdt();
-    vTaskDelay(1);
+    vTaskDelay(0);
 
     if (g_state == ST_SEARCH_BALL || g_state == ST_IDLE) {
         pick_search_target(out);
@@ -2727,8 +2735,6 @@ static void analyze_frame(FrameSight *out)
         out->ball = out->blue;
     }
 
-    pet_wdt();
-    vTaskDelay(1);
     find_net_for_ball(out->ball.found ? &out->ball : NULL, &out->net);
     if (g_state == ST_SEARCH_BLACK || g_state == ST_RETURN_END) {
         out->has_black_line = detect_black_line(&out->black_cx);
@@ -2822,6 +2828,10 @@ static void pulse_center_on_x(int tx, float speed)
         return;
     }
     float om = (abs(err) <= macro) ? CATCH_OMEGA_MICRO : CATCH_OMEGA_MACRO;
+    if (err < 0) {
+        om = -om;
+    }
+    pulse_drive(speed, om);
 }
 
 static bool stage_timeout(void)
@@ -2925,6 +2935,7 @@ static void catch_debug_update(const FrameSight *p)
     s_dbg_ready = true;
     xSemaphoreGive(s_dbg_mutex);
 }
+/* ==================== 状态机 ==================== */
 static void mark_ball_done(void)
 {
     if (g_ball_kind == BALL_RED) {
@@ -2955,7 +2966,7 @@ static void after_backup(void)
     }
     ESP_LOGI(TAG, "后退结束，点动找下一颗球");
     enter_state(ST_SEARCH_BALL);
-    catch_spin_in_place(true);
+    catch_spin_search_ball(true);
 }
 
 static void catch_control_once(void)
@@ -3006,7 +3017,7 @@ static void catch_control_once(void)
             stop_motors();
             enter_state(ST_APPROACH_BALL);
         } else {
-            catch_spin_in_place(true);
+            catch_spin_search_ball(true);
         }
         break;
 
@@ -3205,11 +3216,11 @@ static void line_task(void *arg)
         ESP_LOGW(TAG, "line_follow 未能加入任务看门狗");
     }
     while (1) {
-        pet_wdt();
+        (void)esp_task_wdt_reset();
         if (xSemaphoreTake(s_frame_ready, pdMS_TO_TICKS(150)) != pdTRUE) {
             if (g_mission == MISSION_CATCH) {
                 if (g_state == ST_SEARCH_BALL || g_state == ST_IDLE) {
-                    catch_spin_in_place(true);
+                    catch_spin_search_ball(true);
                 }
             } else if (g_mission != MISSION_DONE) {
                 g_lost_frames++;
@@ -3257,15 +3268,14 @@ static void line_task(void *arg)
                 continue;
             }
             g_decode_ms = (int)((esp_timer_get_time() - t0) / 1000);
-            /* 让 IDLE0 / 中断看门狗有机会跑，避免第一帧彩色处理把芯片复位 */
-            pet_wdt();
+            (void)esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(15));
             if (g_mission == MISSION_CATCH) {
                 catch_control_once();
             } else {
                 stop_motors();
             }
-            pet_wdt();
+            (void)esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
