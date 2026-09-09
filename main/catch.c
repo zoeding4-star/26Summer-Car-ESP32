@@ -479,11 +479,12 @@ static void pulse_orbit_around_front(bool left)
     g_pulse_ready_at = 0;
 }
 
-/* |ldx| 变小则保持原方向；连续变大才按 ldx 符号改向 */
+/* 网在球右侧(ldx>0)时左绕：实车日志里左绕(om>0)会让网的 cx 变小。
+ * |ldx| 变小保持原方向；连续两帧变大则翻转，不能再赋一次 want_left（符号错时永远拧反）。 */
 static bool align_orbit_left(int ldx)
 {
     int al = abs(ldx);
-    bool want_left = (ldx < 0);
+    bool want_left = (ldx > 0);
     if (!g_orbit_dir_valid) {
         g_orbit_left = want_left;
         g_orbit_dir_valid = true;
@@ -494,8 +495,9 @@ static bool align_orbit_left(int ldx)
         } else if (al > g_last_abs_ldx) {
             g_orbit_worse_frames++;
             if (g_orbit_worse_frames >= 2) {
-                g_orbit_left = want_left;
+                g_orbit_left = !g_orbit_left;
                 g_orbit_worse_frames = 0;
+                ESP_LOGI(TAG, "ALIGN reverse orbit left=%d |ldx|=%d", (int)g_orbit_left, al);
             }
         }
     }
