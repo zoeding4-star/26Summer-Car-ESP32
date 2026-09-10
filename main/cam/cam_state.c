@@ -1,0 +1,68 @@
+#include "cam_state.h"
+
+LastDir g_last_dir = LAST_DIR_LEFT;
+Phase g_phase = PHASE_FOLLOW;
+int g_lost_frames = 0;
+int g_decode_ms = 0;
+MotorSpeed g_last_wheels = {0, 0, 0};
+float g_last_vy = 0.0f;
+float g_last_om = 0.0f;
+float g_last_dist = -1.0f;
+float g_current_distance = 0.0f;
+int64_t g_phase_t0 = 0;
+int g_hit_cm = 0;
+int g_t_white = 0;
+bool g_t_seen = false;
+bool g_has_avoided = false;
+volatile Mission g_mission = MISSION_LINE;
+int64_t g_wait_t0 = 0;
+uint8_t *s_rgb;
+uint8_t *s_mask;
+uint8_t *s_visited;
+uint8_t *s_jpeg_work;
+
+SemaphoreHandle_t s_frame_mutex;
+SemaphoreHandle_t s_frame_ready;
+SemaphoreHandle_t s_dbg_mutex;
+uint8_t *s_jpeg;
+volatile uint32_t s_jpeg_len;
+uint8_t *s_gray;
+uint8_t *s_bin;
+uint8_t *s_dbg_gray;
+uint8_t *s_dbg_bin;
+int s_img_w = CAM_WIDTH;
+int s_img_h = CAM_HEIGHT;
+RowScan g_scan_rows[SCAN_ROWS];
+int g_scan_y[SCAN_ROWS];
+int g_poly_x[SCAN_ROWS];
+int g_poly_y[SCAN_ROWS];
+int g_poly_n;
+Sight g_dbg_path;
+int g_dbg_w;
+int g_dbg_h;
+char s_dbg_json[4096];
+int s_dbg_json_len;
+volatile bool s_dbg_ready;
+
+AllWheelRPM g_current_rpm;
+
+PushState g_state = ST_IDLE;
+BallKind g_ball_kind = BALL_RED;
+int64_t g_stage_t0 = 0;
+int g_lock_frames = 0;
+int64_t g_backup_until = 0;
+int64_t g_pulse_ready_at = 0;
+int g_stop_hold = 0;
+FrameSight g_sight;
+BlobTarget g_locked_ball;
+bool g_done_red = false;
+bool g_done_blue = false;
+float g_last_d_ball = -1.0f;
+float g_last_d_net = -1.0f;
+bool g_orbit_dir_valid = false;
+bool g_orbit_left = true;
+int g_last_abs_ldx = -1;
+int g_orbit_worse_frames = 0;
+FrameSight g_dbg_sight;
+PushState g_dbg_state;
+BallKind g_dbg_kind;

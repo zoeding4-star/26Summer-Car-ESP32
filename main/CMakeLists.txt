@@ -1,220 +1,78 @@
-#通过注释来确定编译哪个文件
-# 编译循迹
-# idf_component_register(SRCS  "main_line_tracking.c"
-#                        INCLUDE_DIRS "."
-#                        REQUIRES esp_driver_gpio led_strip esp_driver_ledc esp_timer)
+# ============================================================
+# 应用模式切换：只改下面这一行
+#   "ir"  = 红外循迹 + 超声波避障        （原 main_final.c）
+#   "cam" = 摄像头循迹 + 避障 + 找球推球 （原 cam_avoid_catch.c）
+#
+# 两套工程完全并列，引脚/超参数各自独立（见 ir/ir_config.h 与 cam/cam_config.h）
+# ============================================================
+set(ROBOT_APP_MODE "cam")
 
-# 编译避障
-# idf_component_register(SRCS "cam_avoid_catch.c" "cam_final.c" "cam_line_avoid_ui.c" "mpu_test.c" "catch.c" "main_obstacle_avoid.c"
-#                        INCLUDE_DIRS "."
-#                        REQUIRES esp_driver_gpio led_strip esp_driver_ledc esp_timer)
+if(ROBOT_APP_MODE STREQUAL "ir")
+    message(STATUS "ROBOT_APP_MODE=ir  (红外循迹+避障)")
+    idf_component_register(
+        SRCS
+            "ir/main.c"
+            "ir/motor.c"
+            "ir/sensors.c"
+            "ir/encoder.c"
+            "ir/kinematics.c"
+            "ir/tracking.c"
+            "ir/lcd_ui.c"
+        INCLUDE_DIRS
+            "."
+            "ir"
+        REQUIRES
+            driver
+            freertos
+            esp_timer
+            esp_driver_pcnt
+            esp_driver_gpio
+            esp_driver_spi
+            esp_driver_ledc
+            esp_lcd
+            lvgl
+    )
 
-#编译液晶屏
-# idf_component_register(SRCS "main_led.c"
-#                        INCLUDE_DIRS "."
-#                        REQUIRES esp_driver_gpio led_strip esp_driver_spi esp_driver_ledc esp_timer esp_lcd lvgl)  
+elseif(ROBOT_APP_MODE STREQUAL "cam")
+    message(STATUS "ROBOT_APP_MODE=cam (摄像头循迹+避障+找球)")
+    idf_component_register(
+        SRCS
+            "cam/main.c"
+            "cam/cam_state.c"
+            "cam/util.c"
+            "cam/motor.c"
+            "cam/sensing.c"
+            "cam/lcd_ui.c"
+            "cam/camera.c"
+            "cam/decode.c"
+            "cam/vision_line.c"
+            "cam/vision_catch.c"
+            "cam/catch_fsm.c"
+            "cam/debug_wifi.c"
+            "tjpgd/tjpgd.c"
+        INCLUDE_DIRS
+            "."
+            "cam"
+            "tjpgd"
+        REQUIRES
+            driver
+            freertos
+            usb
+            usb_stream
+            nvs_flash
+            esp_psram
+            esp_timer
+            esp_wifi
+            esp_event
+            esp_netif
+            esp_http_server
+            esp_driver_pcnt
+            esp_driver_spi
+            esp_lcd
+            lvgl
+            esp_jpeg
+    )
 
-# #编译全部功能
-# idf_component_register(SRCS "main_final.c"
-#                        INCLUDE_DIRS "."
-#                        REQUIRES esp_driver_gpio led_strip esp_driver_spi esp_driver_ledc esp_timer esp_lcd lvgl)   
-
-#编译测速文件
-# idf_component_register(SRCS "main_speed.c"
-#                        INCLUDE_DIRS "."
-#                        REQUIRES esp_driver_gpio led_strip esp_driver_spi esp_driver_ledc esp_timer esp_lcd lvgl)   
-
-#编译全部功能
-# idf_component_register(SRCS "main.c"
-#                        INCLUDE_DIRS "."
-#                        REQUIRES esp_driver_gpio led_strip esp_driver_ledc esp_timer)                       
-
-#编译全部功能   
-# idf_component_register(SRCS "main_final.c"
-#                        INCLUDE_DIRS "."
-#                        REQUIRES esp_driver_pcnt esp_driver_gpio led_strip esp_driver_spi esp_driver_ledc esp_timer esp_lcd lvgl)   
-
-# 推球入网（catch.c，彩色 JPEG 解码用 esp_jpeg）
-# idf_component_register(
-#     SRCS "catch.c"
-#     INCLUDE_DIRS "."
-#     REQUIRES
-#         driver
-#         freertos
-#         usb
-#         usb_stream
-#         nvs_flash
-#         esp_psram
-#         esp_timer
-#         esp_wifi
-#         esp_event
-#         esp_netif
-#         esp_http_server
-#         esp_jpeg
-# )
-
-# 编译 MPU6500 测试
-# idf_component_register(
-#     SRCS "mpu_test.c"
-#     INCLUDE_DIRS "."
-#     REQUIRES
-#         driver
-#         esp_driver_i2c
-#         freertos
-# )
-
-# 推球颜色调参（车静止，网页调 HSV）
-# idf_component_register(
-#     SRCS "catch_tune.c"
-#     INCLUDE_DIRS "."
-#     REQUIRES
-#         driver
-#         freertos
-#         usb
-#         usb_stream
-#         nvs_flash
-#         esp_psram
-#         esp_timer
-#         esp_wifi
-#         esp_event
-#         esp_netif
-#         esp_http_server
-#         esp_jpeg
-# )
-
-# 绕前方点 / 贴球微调单独测试
-# idf_component_register(
-#     SRCS "orbit_test.c"
-#     INCLUDE_DIRS "."
-#     REQUIRES
-#         driver
-#         freertos
-#         esp_timer
-# )
-
-# 全程：循迹避障 + 停 3 秒 + 推球（屏幕）
-# idf_component_register(
-#     SRCS "cam_final.c"
-#     INCLUDE_DIRS "."
-#     REQUIRES
-#         driver
-#         freertos
-#         usb
-#         usb_stream
-#         nvs_flash
-#         esp_psram
-#         esp_timer
-#         esp_wifi
-#         esp_event
-#         esp_netif
-#         esp_http_server
-#         esp_driver_pcnt
-#         esp_driver_spi
-#         esp_lcd
-#         lvgl
-#         esp_jpeg
-# )
-
-# 摄像头循迹 + 超声波避障 + 等 2 秒 + 推球
-idf_component_register(
-    SRCS "cam_avoid_catch.c" "tjpgd/tjpgd.c"
-    INCLUDE_DIRS "." "tjpgd"
-    REQUIRES
-        driver
-        freertos
-        usb
-        usb_stream
-        nvs_flash
-        esp_psram
-        esp_timer
-        esp_wifi
-        esp_event
-        esp_netif
-        esp_http_server
-        esp_driver_pcnt
-        esp_driver_spi
-        esp_lcd
-        lvgl
-        esp_jpeg
-)
-
-# 摄像头循迹 + 超声波避障 + 屏幕转速/距离
-# idf_component_register(
-#     SRCS "cam_line_avoid_ui.c" "tjpgd/tjpgd.c"
-#     INCLUDE_DIRS "." "tjpgd"
-#     REQUIRES
-#         driver
-#         freertos
-#         usb
-#         usb_stream
-#         nvs_flash
-#         esp_psram
-#         esp_timer
-#         esp_wifi
-#         esp_event
-#         esp_netif
-#         esp_http_server
-#         esp_driver_pcnt
-#         esp_driver_spi
-#         esp_lcd
-#         lvgl
-# )
-
-# 摄像头循迹 + 超声波避障（无屏幕）
-# idf_component_register(
-#     SRCS "cam_line_avoid.c" "tjpgd/tjpgd.c"
-#     INCLUDE_DIRS "." "tjpgd"
-#     REQUIRES
-#         driver
-#         freertos
-#         usb
-#         usb_stream
-#         nvs_flash
-#         esp_psram
-#         esp_timer
-#         esp_wifi
-#         esp_event
-#         esp_netif
-#         esp_http_server
-# )
-
-# 仅摄像头循迹
-# idf_component_register(
-#     SRCS "cam_line_follow.c" "tjpgd/tjpgd.c"
-#     INCLUDE_DIRS "." "tjpgd"
-#     REQUIRES
-#         driver
-#         freertos
-#         usb
-#         usb_stream
-#         nvs_flash
-#         esp_psram
-#         esp_timer
-#         esp_wifi
-#         esp_event
-#         esp_netif
-#         esp_http_server
-# )
-
-# 声明源码文件与依赖组件
-# idf_component_register(
-#     SRCS "cam_motion.c"                       # 你的 C 代码文件名，如果不是 main.c 请修改为实际文件名
-#     INCLUDE_DIRS "."                    # 头文件包含路径
-#     REQUIRES 
-#         driver                          # 包含 GPIO、LEDC 驱动
-#         freertos                        # 包含 FreeRTOS 任务与信号量
-#         usb                             # 包含 ESP32-S3 底层 USB Host 框架
-#         espressif__usb_host_uvc         # 必须显式链接 USB UVC 组件
-#         esp_wifi
-#         esp_event
-#         nvs_flash
-#         esp_http_server
-#         usb_stream
-#         esp_psram
-#         esp_log
-#         esp_timer
-#         esp_err
-#         esp_lcd_panel_io
-#         esp_lcd_panel_vendor
-#         esp_lcd_panel_ops
-# )
+else()
+    message(FATAL_ERROR "Unknown ROBOT_APP_MODE='${ROBOT_APP_MODE}'. Use \"ir\" or \"cam\".")
+endif()
